@@ -1,0 +1,60 @@
+# 定时把上游 XuexGao/free-llm-router 的 master 同步进本 fork
+#
+# 触发后 → push 到本仓库 master → Cloudflare Workers Builds 自动重新部署
+# 全程不需要任何 Secret：推送目标是本仓库，内置 GITHUB_TOKEN 即可
+name: Sync fork with upstream
+
+on:
+  schedule:
+    # 每天 03:17 UTC（北京时间 11:17）。刻意避开整点，错开其他人的定时任务高峰
+    - cron: '17 3 * * *'
+  workflow_dispatch: {}      # 也可以在 Actions 页面手动点 "Run workflow"
+
+permissions:
+  contents: write            # 只给必要的权限
+
+concurrency:
+  group: sync-fork
+  cancel-in-progress: false  # 正在同步时不要被下一次触发打断
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout（拉完整历史，浅克隆会让 merge 失败）
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: 拉取上游
+        run: |
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/XuexGao/free-llm-router.git
+          git fetch upstream master
+
+      - name: 判断是否需要更新
+        id: check
+        run: |
+          if git diff --quiet HEAD upstream/master; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "已是最新，无需同步。"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git log --oneline HEAD..upstream/master | head -30
+          fi
+
+      - name: 合并上游
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # 干净 fork 会走快进；将来你若自己改了代码，这里会生成合并提交
+          if ! git merge --no-edit upstream/master; then
+            echo "::error::与上游有冲突，自动同步中止。请到 https://github.com/a534008561/free-llm-router 手动处理"
+            exit 1
+          fi
+
+      - name: 推送到本仓库
+        if: steps.check.outputs.changed == 'true'
+        run: git push origin master
