@@ -1197,6 +1197,160 @@ wrangler **内建** `CompiledWasm` 规则（`globs: ["**/*.wasm"]`），`import 
 | **会话粘性** | — | ✅ **已修**，见下方更新记录 |
 | **图片入站** | — | ✅ **实测可用**（见下），旧文档的「未实现」是过时信息 |
 
+#### 本节更新记录（2026-10-06 四）：国内版是**另一套取值**（我上一轮只修了国际版）
+
+**用户追问**：「国内版修了吗」—— 问得对。我上一轮把**国际版的值套到了国内版上**。
+
+参考实现里两个产品是**完全不同的客户端形态**，不是同一个模板换段：
+
+| 项 | 国内版 CodeBuddy（`id:'buddy'`） | 国际版 WorkBuddy |
+|---|---|---|
+| `userAgent` | **`CodeBuddyIDE/1.106.1`** | `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2` |
+| `attributionName`（三个归属头共用） | **`CodeBuddy`** | `WorkBuddy` |
+| `clientVersion` | **`1.106.1`** | `5.5.2` |
+| `apiDomain` | `copilot.tencent.com` | `www.workbuddy.ai` |
+| `productCode` | `codebuddy` | `workbuddy` |
+
+⚠️ 国内版 UA **不是三段式、也不含 `WorkBuddy`** —— 它是 IDE 客户端形态
+（`CodeBuddyIDE/1.106.1`，依据 `product.ts:309` / `buddy.ts:89`）。
+
+**同时修掉一处自相矛盾**：国际版 UA 我一度写成
+`WorkBuddy/5.5.6 … CLI/2.137.1`（混了国内版段），而 `X-IDE-Version` 是 `5.5.2`
+—— **同一请求里两个版本号**，正是「渠道指纹」最容易露馅的地方。
+参考实现逐字是三段同值：`WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2`。
+
+**验证**：pi agent 测两个版本 —— 国内版与**国际版都正常返回**。
+
+⚠️ **教训**：「两个变体」不等于「同一个模板换段」。改一个变体时必须
+**逐个变体核对参考实现的取值**，不能假定另一个只是参数不同。
+
+#### 本节更新记录（2026-10-06 三）：11128 的真正根因 —— 与参考实现逐行对比后定位
+
+**用户报**：`502 channel_blocked: Illegal API invocation from an unapproved channel`
+（国际版与国内版都报），并指出关键线索：
+
+> 「我在 dsh 用 https://gitee.com/iJetLi/deepseek-harness-codearts 这个插件**几乎没失败过**」
+
+**⇒ 同一批账号、同一上游，参考实现不失败而我们失败，差异只可能在请求构造上。**
+把该仓库 clone 下来逐行对比后，找到**两个真正的根因**（都不是账号问题）。
+
+##### 根因一：`role: 'developer'` 被原样转发（决定性）
+
+用**本地日志代理**截获 pi（`pi-coding-agent`）发给我们的真实请求体：
+
+```json
+{"model":"workbuddy/deepseek-v4.1-flash",
+ "messages":[{"role":"developer","content":"You are an expert coding assistant…"}, …]}
+```
+
+⚠️ pi 用的是 **`developer`** 角色（OpenAI **新**规范），而**上游只认**
+`system` / `user` / `assistant` / `tool`。
+我们原样转发 ⇒ 上游判定「**首条不是 system**」⇒ 回
+`11128 unapproved channel`，并用 `displayMsg` **伪装成「安全策略拦截」**
+（"The request was blocked by security policy"），极易误判成账号被封。
+
+**参考实现的做法**（`src/message-shape.ts:99,125`）：**丢弃** `developer`
+（理由：它只承载工具增删元数据 `tool-addition` / `tool-removal`，不是对话内容）。
+
+⚠️ 但 pi 那条 **确实承载系统提示词** —— 直接丢弃会让模型失去行为约束。
+故本项目**多做一步**：**有内容就降级为 `system`**，只有空内容（纯元数据）才丢弃。
+
+同时修正 `withSystemFirst`（`buddy.ts`）：它原判据只认 `role === 'system'`，
+遇到 `developer` 会**多补一条**「You are a helpful assistant.」并排在
+**真正的提示词前面** —— 那会稀释甚至覆盖客户端自己的行为约束。
+现在 `developer` 也视同「已有 system」，不补。
+
+##### 根因二：chat 出站头的口径与参考实现不同
+
+逐行对比 `buddy-adapter.ts:1950-1982` 与我们原先的头：
+
+| 头 | 参考实现（不失败） | 我们原先（11128） |
+|---|---|---|
+| `Accept` | **`text/event-stream`** | `application/json, text/event-stream` |
+| `X-Domain` | ✅ `www.workbuddy.ai` | ❌ 缺失 |
+| `X-Product-Code` | ✅ `workbuddy` | ❌ 缺失 |
+| `Origin` / `Referer` | ❌ 不发 | ✅ 发（**国内**域名打国际版端点） |
+| `X-Requested-With` / `X-CodeBuddy-Request` | ❌ 不发 | ✅ 发 |
+| `X-Machine-ID` / `X-Session-ID` | ❌ 不发 | ✅ 发 |
+| `X-Conversation-Request-ID` 等 4 个 | ❌ 不发 | ✅ 发 |
+| UA 中段 | `WorkBuddy **AI**`（国际版） | `WorkBuddy` |
+
+参考实现只发 **11 个**头；我们那批多余的头来自 **Go 侧实现**
+（`internal/upstream/headers.go`），而那套口径**在国际版端点上不被认可**。
+
+**修法**：新增 `referenceChatHeaders()` —— 按参考实现**逐字对齐**只发那 11 个，
+两条 chat 路径（gateway 的 buddy 路径 + provider 路径）统一使用它。
+同时给 `cliChatHeaders` 补上按变体切换的 `X-Domain` / `X-Product-Code` / UA
+（中段 ` AI` 只在国际版出现）、`X-IDE-Version`（国际版 `5.5.2`）。
+
+##### 验证
+
+- 直连 curl：国际版 **5/5 通过**（修复前 8/8 全 11128）；
+- **pi agent**：国际版与国内版**都正常返回**（修复前两者都失败）。
+
+##### ⚠️ 方法论教训
+
+**「同一批账号，别人的实现能用」是最强的定位线索** ——
+它把问题**排除在账号/上游之外**，直接指向请求构造。
+我前面几轮一直在账号、冷却、CPU、IP 级 WAF 上打转，
+**早就该去读那个"能用"的实现**。
+
+#### 本节更新记录（2026-10-06 二）：我上一轮的修法引入的两个假故障
+
+**用户报**（就在上一轮修复之后）：
+
+```
+503: 出口 IP 疑似被上游 WAF 拦截（短时间内多个账号接连 403）…稍后自动恢复
+503: 供应商「workbuddy」的 1 个账号都在冷却中（因连续失败触发退避），约 30 分钟后自动恢复
+「但两个明明都是正常的啊，有的软件好像可以，有的又不行」
+```
+
+**根因：我上一轮把 `11128` 归为 `waf_blocked`，而那会触发 IP 级判定。**
+
+`waf_blocked` 在网关里是**双重身份**：既表示「账号软冷却」，又表示
+「**可能是出口 IP 级拦截**」⇒ 会调用 `noteWaf()` 累加「IP 级命中」计数，
+凑够 `WAF_IP_THRESHOLD = 2` 就**全局停服 60 秒**。
+
+⚠️ 而 `11128` 与出口 IP **毫无关系** —— 它是**正常的业务码响应**
+（`{"code":11128,"msg":"unapproved channel"}`），
+不是 `waf_blocked` 所要求的「**HTTP 403 + 无业务信封**」形态。
+
+⇒ 于是每次渠道拦截都被记成「IP 级 403 命中」，
+用户有 **3 个账号**，极易凑够阈值 ⇒ **误报全局封锁**。
+
+**这就是「有的软件能用、有的不行」的原因**：
+差别在**请求指纹**，不在账号；而我们的错误处置把它变成了账号/IP 级的假故障。
+
+### 修法：新增独立的 `channel_blocked` 类别
+
+| 类别 | 形态 | 是否 IP 级 | 换号 | 罚账号 |
+|---|---|---|---|---|
+| `waf_blocked` | **HTTP 403 + 无业务信封** | ⚠️ 可能是 | ❌ | ✅ 软冷却 |
+| `channel_blocked` | **业务码 11128**（正常响应） | ❌ **无关** | ❌ | ❌ **不罚** |
+
+⚠️ **`channel_blocked` 连软冷却都不做**，理由：`11128` 有两种可能来源
+（① 我们的指纹本身有问题 ⇒ **所有账号都会命中**，罚谁都没用；
+② 上游对某账号风控升级 ⇒ 那才该罚）。
+①是最可能的情形，而罚账号会**制造健康账号的假故障**（用户看到的「都在冷却中」）。
+
+⇒ 正确处置：**如实把错误返回给客户端 + 不再轮转**
+（换号无用，只会把同样的渠道判定打给更多账号）。
+
+### 处置
+
+部署后：清除被误累积的冷却（cn/global 各 0 条）+ **解除被误激活的 IP 级封锁**
+（`/admin/waf/clear`，两个 realm 都清）。清后 4 个账号均
+`fails=0 until=0 breakerUntil=0 disabled=false`，WAF 门 `active=false`。
+
+**实测**：buddy 与 workbuddy 各打一次极短请求 ⇒ **均 200**。
+
+### ⚠️ 教训
+
+**同一个错误类别被两处语义复用时，改动它的归属会同时影响两处。**
+我上一轮只想着「11128 不该熔断账号」，就把它塞进了 `waf_blocked`
+—— 却没注意 `waf_blocked` 还挂着 **IP 级判定**这个副作用。
+**改错误分类前，必须先查清该类别的所有下游消费点。**
+
 #### 本节更新记录（2026-10-06）：11128 渠道拦截被误判为账号故障
 
 **用户报**：「buddy 和 workbuddy 明明账号是好的，但就是用不了」，报错两类：

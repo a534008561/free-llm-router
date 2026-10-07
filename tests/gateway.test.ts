@@ -15,6 +15,7 @@
  */
 
 import { test } from 'node:test'
+import { referenceChatHeaders } from '../src/upstream/headers.ts'
 import { classify } from '../src/upstream/client.ts'
 
 /**
@@ -913,14 +914,22 @@ test('⚠️ 有内容/干净帧在生产路径（有状态转换器）上的开
   // 拿它做性能断言会误报（实测会 20ms+，但那不是线上路径）。
   const thinking =
     '{"choices":[{"index":0,"delta":{"content":"","reasoning_content":"The"},"finish_reason":null}],"usage":null}'
+  // ⚠️ **用中位数而不是单次测量**：CI/沙箱上单次测量会被其它负载干扰
+  //（实测同一代码在 6ms 与 21ms 之间抖动），那会让这条测试变成**噪声源**。
   const t = createFrameTranslator()
   const N = 8000
-  const start = performance.now()
-  for (let i = 0; i < N; i += 1) t.translate(thinking)
-  const elapsed = performance.now() - start
+  const runs: number[] = []
+  for (let r = 0; r < 7; r += 1) {
+    const start = performance.now()
+    for (let i = 0; i < N; i += 1) t.translate(thinking)
+    runs.push(performance.now() - start)
+  }
+  runs.sort((a, b) => a - b)
+  const median = runs[Math.floor(runs.length / 2)] ?? 0
   assert.ok(
-    elapsed < 15,
-    `⚠️ ${N} 帧耗时 ${elapsed.toFixed(1)}ms —— 疑似快速路径失效（超 10ms 配额就会切流）`,
+    median < 20,
+    `⚠️ ${N} 帧**中位**耗时 ${median.toFixed(1)}ms（原始样本 ${runs.map((x) => x.toFixed(1)).join(',')}）`
+      + ' —— 疑似快速路径失效（超 10ms 配额就会切流）',
   )
   // ⚠️ 配对的**正向**用例：证明这条断言不是恒真（否则它锁不住任何东西）。
   const slow =
@@ -1060,13 +1069,18 @@ test('🔴 11128 必须判为渠道拦截（waf_blocked），不是 request_ille
   // - `11128` 是**请求的渠道指纹不被认可** ⇒ 与账号好坏**无关**。
   //
   // ⚠️ 原实现把 11128 归为 `request_illegal` ⇒ `dimension: 'breaker'`
-  // ⇒ 罚账号（`fails++`，**3 次就熔断 30 分钟**）
-  // ⇒ 好账号被逐个熔断 ⇒ 正是用户看到的现象。
+  // ⇒ 罚账号（`fails++`，**3 次就熔断 30 分钟**）⇒ 好账号被逐个熔断。
+  //
+  // 修 ① 改成 waf_blocked（治好了熔断）**但引入了新缺陷**：
+  // waf_blocked 会触发 `noteWaf` 的 IP 级判定，凑够 2 个账号就**误报全局封锁**
+  //（用户报「显示出口 IP 被 WAF 拦截」）。故现在用**独立的 channel_blocked**。
   const body = JSON.stringify({
     code: 11128,
     msg: 'Illegal API invocation from an unapproved channel',
   })
-  assert.equal(classify(400, body).kind, 'waf_blocked', '11128 必须判为渠道拦截')
+  // ⚠️ 必须是**独立的 channel_blocked**，不能是 waf_blocked ——
+  // 后者会触发 IP 级判定（noteWaf），导致「误报出口 IP 被拦」的全局 503。
+  assert.equal(classify(400, body).kind, 'channel_blocked', '11128 必须判为 channel_blocked')
 
   // ⚠️ 配对的**反向**用例：真正的 11140 仍须罚账号（否则非法请求不会被制止）
   const illegal = JSON.stringify({ code: 11140, msg: 'illegal request' })
@@ -1076,10 +1090,14 @@ test('🔴 11128 必须判为渠道拦截（waf_blocked），不是 request_ille
 test('🔴 渠道拦截不得触发账号熔断（好号被逐个熔断就是用户报的现象）', () => {
   // `waf_blocked` 的处置必须是**软冷却 + 不换号**：
   // 换号撞的是同一套渠道判定，只会把风控放大到更多账号上。
-  const mapped = mapErrorToPunishment('waf_blocked')
-  assert.equal(mapped.dimension, 'soft', '⚠️ 渠道拦截必须软冷却，不能 breaker')
-  assert.notEqual(mapped.dimension, 'breaker', '熔断会让好号被逐个停用')
+  const mapped = mapErrorToPunishment('channel_blocked')
+  assert.equal(mapped.punish, false, '⚠️ 渠道拦截**不该罚账号**（它说的是请求指纹，不是账号）')
   assert.equal(mapped.rotate, false, '⚠️ 不换号 —— 换号撞同一堵墙且放大风控')
+
+  // ⚠️ 同时确认 HTTP 403 的 WAF 仍然要软冷却（那是真的拦截）
+  const waf = mapErrorToPunishment('waf_blocked')
+  assert.equal(waf.punish, true, 'HTTP 403 的 WAF 仍须软冷却')
+  assert.equal(waf.dimension, 'soft')
 })
 
 test('🔴 流内错误必须按类别罚，不能一律 breaker', () => {
@@ -1127,4 +1145,159 @@ test('⚠️ 客户端版本号必须与仓库内实测依据一致（5.5.6）',
   // 同仓库内保持一致
   const rt = readFileSync('src/upstream/realtime.ts', 'utf8')
   assert.ok(rt.includes("'5.5.6'"), 'realtime 用的也是 5.5.6（保持一致）')
+})
+
+test('🔴 渠道拦截绝不能触发 IP 级判定（否则误报「出口 IP 被 WAF 拦截」）', () => {
+  // ## 实测缺陷（用户报两个 503）
+  //
+  // 报障原文：
+  // ```
+  // 503: 出口 IP 疑似被上游 WAF 拦截（短时间内多个账号接连 403）
+  // 503: 供应商「workbuddy」的 1 个账号都在冷却中…约 30 分钟后自动恢复
+  // ```
+  // 但「两个明明都是正常的」。
+  //
+  // 根因是我上一轮的修法**引入了新缺陷**：把 11128 归为 `waf_blocked`，
+  // 而 `waf_blocked` 会触发 `noteWaf` 的 **IP 级判定** ——
+  // 每次 11128 都被记成「IP 级 403 命中」，凑够 `WAF_IP_THRESHOLD = 2`
+  // 就**全局停服 60 秒**。而用户有 3 个账号，极易触发。
+  //
+  // ⚠️ 11128 是**正常的业务码响应**（`{"code":11128}`），
+  // 不是 HTTP 403 无信封 —— 两者形态完全不同，必须分开分类。
+  const src = readFileSync('src/gateway/server.ts', 'utf8')
+  const i = src.indexOf("if (kind === 'waf_blocked')")
+  assert.ok(i > 0, '应能找到 IP 级判定入口')
+  const block = stripComments(src.slice(i, i + 400))
+
+  // IP 级判定**只**对 waf_blocked 触发
+  assert.ok(/kind === 'waf_blocked'/.test(block), 'IP 级判定只应对 HTTP 403 的 WAF 触发')
+  assert.ok(
+    !/channel_blocked/.test(block),
+    '⚠️ channel_blocked（11128）**不得**进入 IP 级判定 —— 它与出口 IP 无关',
+  )
+})
+
+test('⚠️ 渠道拦截与 WAF 必须是两个独立类别（形态不同、处置不同）', () => {
+  // - `waf_blocked`：**HTTP 403 + 无业务信封** ⇒ 可能是出口 IP 级 ⇒ 需要 IP 判定
+  // - `channel_blocked`：**业务码 11128** ⇒ 请求指纹问题 ⇒ 与 IP / 账号都无关
+  //
+  // ⚠️ 混为一类会产生两个假故障：
+  //   ① 健康账号被逐个软冷却；
+  //   ② 凑够阈值后误报「出口 IP 被拦」并全局停服。
+  const src = readFileSync('src/upstream/client.ts', 'utf8')
+  assert.ok(/11128: 'channel_blocked'/.test(src), '11128 必须归为 channel_blocked')
+  assert.ok(!/11128: 'waf_blocked'/.test(src), '⚠️ 不得再归为 waf_blocked')
+
+  // 两者的处置都要「不换号」，但罚款不同
+  assert.equal(mapErrorToPunishment('channel_blocked').rotate, false)
+  assert.equal(mapErrorToPunishment('channel_blocked').punish, false, '不罚账号')
+  assert.equal(mapErrorToPunishment('waf_blocked').punish, true, 'HTTP 403 仍要软冷却')
+})
+
+// ───── `role: 'developer'` 导致 11128（用户报两处 502 的根因） ─────
+
+test("🔴 `role:'developer'` 必须被降级为 system（否则上游判「首条不是 system」→ 11128）", () => {
+  // ## 实测根因（用户报「错误 502 … unapproved channel」）
+  //
+  // 用本地日志代理抓到 pi（`pi-coding-agent`）的**真实请求体**：
+  // ```json
+  // {"model":"workbuddy/deepseek-v4.1-flash",
+  //  "messages":[{"role":"developer","content":"You are an expert coding assistant…"}, …]}
+  // ```
+  // ⚠️ 它用的是 **`developer`** 角色（OpenAI **新**规范），而**上游只认**
+  // `system` / `user` / `assistant` / `tool`。
+  //
+  // 我们原样转发 ⇒ 上游判定「首条不是 system」⇒ 国际版回
+  // `11128 Illegal API invocation from an unapproved channel`
+  //（`displayMsg` 把它**伪装成「安全策略拦截」**，极易误判成账号被封）。
+  //
+  // 参考实现的做法是**丢弃** `developer`（`message-shape.ts:99,125`，
+  // 理由：它只承载工具增删元数据）。但 pi 那条**确实承载系统提示词**，
+  // 丢掉会让模型失去行为约束 ⇒ 我们**多做一步**：有内容就降级为 `system`。
+  const msgs = [
+    { role: 'developer', content: 'You are an expert coding assistant.' },
+    { role: 'user', content: 'hi' },
+  ]
+  const out = cleanupToolPairing(msgs) as Array<Record<string, unknown>>
+  assert.equal(out.length, 2, '两条都应保留')
+  assert.equal(out[0]!.role, 'system', '⚠️ developer 必须降级为 system（保住提示词语义）')
+  assert.equal(out[0]!.content, 'You are an expert coding assistant.')
+
+  // ⚠️ 配对的**反向**用例：空的 developer（纯元数据）应当**丢弃**，
+  // 否则会给上游造出一条空 system。
+  const meta = cleanupToolPairing([
+    { role: 'developer', content: '' },
+    { role: 'user', content: 'hi' },
+  ]) as Array<Record<string, unknown>>
+  assert.equal(meta.length, 1, '空 developer 应被丢弃')
+  assert.equal(meta[0]!.role, 'user')
+
+  // 无 developer 时**不得**改动（零成本透传，且保持数组引用不变）
+  const plain = [{ role: 'user', content: 'hi' }]
+  assert.equal(cleanupToolPairing(plain), plain, '无改动时应返回原数组引用')
+})
+
+test("⚠️ 国际版的「首条必须是 system」判据必须把 developer 视同 system", () => {
+  // ⚠️ 若只认 `role === 'system'`，`withSystemFirst` 会**多补一条**
+  // 「You are a helpful assistant.」并排在真正的提示词**前面** ——
+  // 那会稀释（甚至覆盖）客户端自己的行为约束。
+  //
+  // 而 pi 的 developer 是首条 ⇒ 必须被视同「已有 system」，不补。
+  const src = readFileSync('src/providers/buddy.ts', 'utf8')
+  const i = src.indexOf('function withSystemFirst')
+  const block = stripComments(src.slice(i, i + 1200))
+  assert.ok(/firstRole === 'system'/.test(block), '应认 system')
+  assert.ok(/firstRole === 'developer'/.test(block), '⚠️ developer 也必须视同 system')
+})
+
+test('🔴 国内版与国际版的 chat 头必须是**两套不同取值**（不能套用）', () => {
+  // ## 实测缺陷：我一度把国际版的值套到国内版上
+  //
+  // 参考实现（`deepseek-harness-codearts/src/product.ts`）里两个产品是
+  // **完全不同的客户端形态**，不是同一个模板换段：
+  //
+  // | 项 | 国内版 CodeBuddy（`id:'buddy'`） | 国际版 WorkBuddy |
+  // |---|---|---|
+  // | `userAgent` | **`CodeBuddyIDE/1.106.1`** | `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2` |
+  // | `attributionName`（三个归属头共用） | **`CodeBuddy`** | `WorkBuddy` |
+  // | `clientVersion` | **`1.106.1`** | `5.5.2` |
+  // | `apiDomain` | `copilot.tencent.com` | `www.workbuddy.ai` |
+  // | `productCode` | `codebuddy` | `workbuddy` |
+  const dom = referenceChatHeaders({ uid: 'u', accessToken: 'tok', variant: 'buddy' })
+  const intl = referenceChatHeaders({ uid: 'u', accessToken: 'tok', variant: 'workbuddy' })
+
+  // ⚠️ UA 是完全不同的格式（国内版不含 `WorkBuddy`）
+  assert.equal(dom['User-Agent'], 'CodeBuddyIDE/1.106.1', '国内版 UA 必须是 IDE 形态')
+  // ⚠️ 国际版 UA 逐字对齐参考实现（三段**同值** 5.5.2）
+  assert.equal(
+    intl['User-Agent'], 'WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2',
+    '国际版 UA 三段都应是 5.5.2（我一度混了国内版段，导致与 X-IDE-Version 自相矛盾）',
+  )
+  // ⚠️ UA 里的版本号必须与 X-IDE-Version 一致 —— 同一请求里两个版本号
+  // 正是「渠道指纹」最容易露馅的地方。
+  assert.equal(intl['X-IDE-Version'], '5.5.2')
+  assert.ok(intl['User-Agent']?.includes('5.5.2'), 'UA 与 X-IDE-Version 必须同版本')
+
+  // ⚠️ 归属三头在国内版是 `CodeBuddy`
+  assert.equal(dom['X-IDE-Name'], 'CodeBuddy', '国内版归属名是 CodeBuddy')
+  assert.equal(dom['X-IDE-Type'], 'CodeBuddy')
+  assert.equal(dom['X-Product'], 'CodeBuddy')
+  assert.equal(intl['X-IDE-Name'], 'WorkBuddy', '国际版归属名是 WorkBuddy')
+
+  // ⚠️ 版本号不同
+  assert.equal(dom['X-IDE-Version'], '1.106.1', '国内版版本是 1.106.1')
+  assert.equal(intl['X-IDE-Version'], '5.5.2', '国际版版本是 5.5.2')
+
+  // X-Domain 必须与端点一致
+  assert.equal(dom['X-Domain'], 'copilot.tencent.com')
+  assert.equal(intl['X-Domain'], 'www.workbuddy.ai')
+  assert.equal(dom['X-Product-Code'], 'codebuddy')
+  assert.equal(intl['X-Product-Code'], 'workbuddy')
+
+  // ⚠️ 参考实现只发这 11 个（多发的头是 Go 侧口径，国际版端点不认）
+  assert.equal(dom['Accept'], 'text/event-stream', 'Accept 必须精确（不能带 json 偏好）')
+  assert.ok(!('Origin' in dom), '⚠️ 不得发 Origin（Go 侧口径，参考实现不发）')
+  assert.ok(!('X-Machine-ID' in dom), '⚠️ 不得发 X-Machine-ID')
+  assert.ok(!('X-Conversation-Request-ID' in dom), '⚠️ 不得发 X-Conversation-Request-ID')
+  assert.equal(dom['Authorization'], 'Bearer tok', '只保留 Authorization')
 })
