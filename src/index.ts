@@ -1090,6 +1090,27 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
   }
 
   // ── 删除账号（连带凭据；不可逆，故要求显式确认字段） ──
+  // ── 按账号启用/停用（面板的「停用 / 启用」按钮） ──
+  //
+  // ⚠️ 与 `/admin/accounts/remove` 的区别：这个**可逆**，故**不需要 confirm**。
+  // 用户点错了再点一次就好，加确认反而烦。
+  if (path === '/admin/accounts/toggle' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as {
+      uid?: string; realm?: string; disabled?: boolean
+    }
+    if (typeof body.uid !== 'string' || body.uid === '') {
+      return json({ error: { message: 'uid 必填' } }, 400)
+    }
+    if (typeof body.disabled !== 'boolean') {
+      return json({ error: { message: 'disabled 必须是布尔值' } }, 400)
+    }
+    const realm = body.realm ?? 'cn'
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const ok = await pool.setAccountDisabled(body.uid, body.disabled, Date.now())
+    if (!ok) return json({ error: { message: '账号不存在' } }, 404)
+    return json({ ok: true, uid: body.uid, disabled: body.disabled, realm })
+  }
+
   if (path === '/admin/accounts/remove' && request.method === 'POST') {
     const body = (await request.json().catch(() => ({}))) as { uid?: string; realm?: string; confirm?: boolean }
     if (typeof body.uid !== 'string' || body.uid === '') {
@@ -1410,6 +1431,59 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
         )
       }
     }
+
+    // ── loomy（讯飞办公助手）：**短信验证码**登录 ──
+    //
+    // ## ⚠️ 与其它家都不同：它**没有 loginUrl**，要用户输入
+    //
+    // 参考实现的注释写得很清楚（`src/loomy-oauth.ts:6-7`）：
+    // > 那 7 个都是「返回 loginUrl → 前端 window.open → 轮询 login.poll」。
+    // > 短信登录**没有 URL 可打开**，故走「发验证码 → 用户输入 → 提交」三步。
+    //
+    // ## ✅ 为什么它在 Workers 上**可行**（与微信扫码相反）
+    //
+    // 短信路径是**纯 HTTP 三步**，`loomy-oauth.ts` 里 `127.0.0.1` 出现 **0 次**
+    //（实测 grep）—— 不需要任何本地回调监听。
+    // ⚠️ 而 loomy 的**微信扫码**路径需要本地服务器承载弹窗页
+    //（`loomy-wechat-login.ts:11-13` 的 `127.0.0.1:随机端口`），那条**不可行**。
+    //
+    // ## 流程
+    //
+    // 1. `POST {provider:'loomy', phone}` → 发短信，返回 `state`（存 msgid）
+    // 2. `POST {provider:'loomy', phone, code, state}` → 校验，拿 session/userid
+    //
+    // ⚠️ `msgid` 必须持久化在登录会话里（Workers 无跨请求内存）——
+    // 丢了它第二步会被服务端判「msgid 无效」，而那个报错与真实原因无关
+    //（参考实现 `loomy-oauth.ts:141-144` 专门为此不返回空串）。
+    if (providerId === 'loomy') {
+      const { sendLoomySmsCode } = await import('./providers/loomy.js')
+      const reqBody = await request.json().catch(() => ({})) as { phone?: string }
+      const phone = typeof reqBody.phone === 'string' ? reqBody.phone.trim() : ''
+      // ⚠️ 只做**最基本的**格式检查（11 位数字，1 开头）—— 详细的号码规则
+      // 交给上游判（它才知道哪些号段可用）。这里拦的是明显的空值/乱填。
+      if (!/^1\d{10}$/.test(phone)) {
+        return jsonError(400, '请填写 11 位手机号（以 1 开头）', 'invalid_phone')
+      }
+      try {
+        const msgid = await sendLoomySmsCode(phone, AbortSignal.timeout(30_000))
+        const state = crypto.randomUUID()
+        const now = Date.now()
+        // 验证码 5 分钟有效（`LOOMY_SMS_CODE_TTL_SECONDS`）。
+        await pool.saveLoginSession(
+          state,
+          { provider: 'loomy', kind: 'loomy-sms', realm: loginRealm, phone, msgid, createdAt: now },
+          // ⚠️ TTL 用**上游的验证码有效期**，不留宽限：码过期后再提交
+          // 必然是「验证码错误」，多留时间只会让用户白等。
+          5 * 60 * 1000,
+        )
+        return json({ ok: true, provider: 'loomy', state, phone, needsCode: true })
+      } catch (error) {
+        return json(
+          { error: { message: error instanceof Error ? error.message : String(error), type: 'login_start_failed' } },
+          502,
+        )
+      }
+    }
     // ── workbuddy（国际版）：与 buddy 同一套设备码协议，只是换域名 ──
     //
     // ⚠️ 这条分支此前**缺失**，故 `/admin/login/start?provider=workbuddy` 会
@@ -1459,6 +1533,67 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
       `供应商「${providerId}」不支持从本服务发起登录（${providerId === DEFAULT_PROVIDER ? '请用 /admin/login/start' : '请粘贴凭据导入'}）`,
       'login_unsupported',
     )
+  }
+
+  // ── loomy 短信登录第 2 步：提交验证码 ──
+  //
+  // ⚠️ 为什么单独一个端点而不是复用 `/login/poll`：
+  // 短信登录**不是轮询** —— 它是「用户输入后主动提交」。
+  // 塞进 poll（那是个按 state 查询的 GET）会让两种语义混在一处：
+  // poll 是**幂等只读**，而这个**会消费验证码**（提交即用掉）。
+  // ⚠️ 更不能做成 GET：验证码会进 URL，落进日志与 Referer。
+  if (path === '/admin/providers/login/loomy/sms' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as {
+      state?: string; phone?: string; code?: string; realm?: string
+    }
+    const state = typeof body.state === 'string' ? body.state : ''
+    const code = typeof body.code === 'string' ? body.code.trim() : ''
+    if (state === '') return jsonError(400, 'state 必填（重新发起登录）', 'missing_state')
+    if (!/^\d{4,8}$/.test(code)) return jsonError(400, '请填写收到的验证码', 'invalid_code')
+
+    const realm = body.realm === 'global' ? 'global' : 'cn'
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const saved = await (async () => {
+      // 逐个分片找（与 `/login/poll` 同法：会话所在分片由发起时决定）
+      for (const r of [realm, realm === 'cn' ? 'global' : 'cn']) {
+        const p = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(r))
+        const hit = (await p.getLoginSession(state, Date.now())) as
+          | { payload: Record<string, unknown>; pool: typeof p }
+          | undefined
+        if (hit !== undefined) return { payload: hit.payload, pool: p }
+      }
+      return undefined
+    })()
+    if (saved === undefined) {
+      return jsonError(404, '登录会话不存在或已过期，请重新发起登录', 'session_not_found')
+    }
+    if (saved.payload['kind'] !== 'loomy-sms') {
+      return jsonError(400, '该会话不是短信登录，请重新发起', 'wrong_flow')
+    }
+    const msgid = typeof saved.payload['msgid'] === 'string' ? saved.payload['msgid'] : ''
+    const phone = typeof saved.payload['phone'] === 'string' ? saved.payload['phone'] : ''
+    if (msgid === '' || phone === '') {
+      await saved.pool.removeLoginSession(state)
+      return jsonError(400, '登录会话缺少 msgid/phone，请重新发起登录', 'session_incomplete')
+    }
+
+    const { loginLoomyBySmsCode } = await import('./providers/loomy.js')
+    try {
+      const result = await loginLoomyBySmsCode(phone, code, msgid, AbortSignal.timeout(30_000))
+      // ⚠️ 验证码是**一次性**的：无论成败都清掉会话，
+      // 免得用户拿同一个码重复提交（上游会回「已使用」，那个报错会让人困惑）。
+      await saved.pool.removeLoginSession(state)
+      return json(await persistProviderCredential(env, result.credential, Date.now()))
+    } catch (error) {
+      // ⚠️ 失败**也清会话**（同上：码已消费）。用户需要重新发码。
+      await saved.pool.removeLoginSession(state)
+      const message = error instanceof Error ? error.message : String(error)
+      // ⚠️ 文案要说清「下一步做什么」：用户卡在这里最需要知道的是「重新获取验证码」。
+      return json(
+        { error: { message: `验证码校验失败：${message}。请重新获取验证码后再试。`, type: 'sms_failed' } },
+        400,
+      )
+    }
   }
 
   // ── 轮询供应商登录结果 ──
@@ -1877,7 +2012,44 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
 
   // ── 供应商目录（面板用：显示每家的能力与登录阻塞原因） ──
   if (path === '/admin/providers' && request.method === 'GET') {
-    return json({ default: DEFAULT_PROVIDER, providers: providerCatalog() })
+    // ⚠️ 带上**面板设置**（顺序 + 已关闭的家）—— 面板据此渲染
+    //   「供应商」卡片与排序。「关闭」是**服务端**状态（会真的影响
+    //   `/v1/models` 与路由），不是浏览器 localStorage。
+    //
+    // ⚠️ 设置存在 `cn` 分片的 DO 里当全局值用（见 `getProviderSettings` 的说明）。
+    // 读失败**不能让整个端点失败** —— 设置只是展示偏好，缺了就用默认顺序。
+    let settings: { order: string[]; disabled: string[] } = { order: [], disabled: [] }
+    try {
+      const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+      settings = await cnPool.getProviderSettings()
+    } catch {
+      // 用默认值（空顺序 = 注册表原顺序；无关闭）
+    }
+    return json({
+      default: DEFAULT_PROVIDER,
+      providers: providerCatalog(),
+      order: settings.order,
+      disabled: settings.disabled,
+    })
+  }
+
+  // ── 改供应商面板设置（顺序 / 启用开关） ──
+  //
+  // ⚠️ 语义（用户明确）：
+  // · **关闭 = 彻底关掉** ⇒ 该家的模型从 `/v1/models` 消失、也拒绝路由到它；
+  // · **排序只影响面板展示**，**不**改默认供应商
+  //  （裸模型名仍回落到 `DEFAULT_PROVIDER` —— 悄悄改掉既有请求的路由不可接受）。
+  if (path === '/admin/providers/settings' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as { order?: unknown; disabled?: unknown }
+    const known = new Set(providerIds())
+    const toIds = (v: unknown): string[] =>
+      Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && known.has(x)) : []
+    // ⚠️ 未知 id 一律丢弃：否则一个笔误就会在存储里留下永远匹配不上的条目。
+    const order = toIds(body.order)
+    const disabled = toIds(body.disabled)
+    const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    await cnPool.setProviderSettings({ order, disabled })
+    return json({ ok: true, order, disabled })
   }
 
   // ── 按供应商列模特（面板用） ──
@@ -2390,7 +2562,20 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     const errors: Array<{ provider: string; error: string }> = []
     let disabledTotal = 0
 
+    // ⚠️ 读一次「已被用户关闭的供应商」——关闭 = **彻底关掉**：
+    // 它们的模型**不出现在目录里**（也不允许路由到，见 handleChatCompletions
+    // 的同类判据）。设置是全局的，故只需读 cn 分片一次。
+    const userDisabledProviders = new Set<string>()
+    try {
+      const cnPool = pools.get('cn') ?? env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+      for (const id of (await cnPool.getProviderSettings()).disabled) userDisabledProviders.add(id)
+    } catch {
+      // 读不到设置就按「都没关」处理 —— 目录功能不该因为偏好读取失败而整体失败
+    }
+
     for (const [providerId, list] of byProvider) {
+      // ⚠️ 用户关闭的家直接跳过（不入 errors：那不是**故障**，是用户的**选择**）
+      if (userDisabledProviders.has(providerId)) continue
       const provider = findProvider(providerId)
       if (provider === undefined || !provider.capabilities.listModels) continue
       const picked = list.find((x) => !x.account.disabled)
