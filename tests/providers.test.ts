@@ -536,3 +536,324 @@ test('⚠️ 二维码容量：超长内容应抛错而不是产出扫不出来�
   // 实际文案：「二维码内容过长（500 字节，上限 213 字节），请缩短内容」
   assert.throws(() => renderQrSvg('x'.repeat(500)), /过长|上限|213/)
 })
+
+// ───── 续期缺失：同型缺陷第 2 次（实测「号用一会儿就废」） ─────
+
+test('🔴 minimax 必须挂上 refresh（否则 token 过期后账号永久 401）', () => {
+  // ## 实测缺陷
+  //
+  // 上线实测：minimax 起初能正常对话，**几分钟后**全部变成
+  // `http=401 invalid access token`，而账号状态看起来完全正常。
+  //
+  // 根因：该 provider **完全没有 `refresh` 方法**，而凭据里明明有
+  // `refresh_token`。网关按 `provider.refresh !== undefined` 决定要不要续期
+  //（`src/gateway/server.ts:934,1003`）—— 它是 `undefined` ⇒ 不续期、直接失败。
+  //
+  // ⚠️ 这是本项目第 2 次踩到「续期写好了却没人调」（第 1 次见
+  // `types.ts` 的说明）。故连单测一起补上，防第 3 次。
+  const src = readFileSync('src/providers/minimax.ts', 'utf8')
+  assert.ok(/^async function refresh\(/m.test(src), '应有 refresh 函数')
+  assert.ok(/^  refresh,$/m.test(src), '⚠️ 必须**挂到 provider 对象**上（只定义不挂 = 等于没有）')
+  // 端点与参数必须逐字对（client_id 错了上游回 invalid_client）
+  assert.ok(src.includes("'/oauth2/token'"), '端点应为 /oauth2/token')
+  assert.ok(src.includes("'mcode-public'"), 'client_id 必须是官方常量 mcode-public')
+  assert.ok(src.includes("grant_type: 'refresh_token'"), '必须是 refresh_token grant')
+  assert.ok(src.includes("'agent.default'"), 'scope 必须是 agent.default')
+  assert.ok(src.includes("'agent-backend'"), 'audience 必须是 agent-backend')
+  // ⚠️ 新 refresh_token 缺失时必须**保留旧值**，否则「本次成功」变「下次永远失败」
+  assert.ok(/nextRefreshRaw !== undefined && nextRefreshRaw\.length > 0[\s\S]{0,80}: credential\.refreshToken/.test(src),
+    '⚠️ 新 refresh_token 为空时必须保留旧值')
+  // ⚠️ 终态文案必须含「重新登录」（调用方按该子串判定不该重试）
+  assert.ok(/请重新登录/.test(src), '终态文案要含「重新登录」')
+})
+
+test('🔴 lobsterai 必须挂上 refresh（同型缺陷）', () => {
+  const src = readFileSync('src/providers/lobsterai.ts', 'utf8')
+  assert.ok(/^async function refresh\(/m.test(src), '应有 refresh 函数')
+  assert.ok(/^  refresh,$/m.test(src), '⚠️ 必须挂到 provider 对象上')
+  assert.ok(src.includes("'/api/auth/refresh'"), '端点应为 /api/auth/refresh')
+  // ⚠️ 续期**不带 Authorization**（参考实现同款）：带过期 Bearer 只会多一个被拒理由
+  const i = src.indexOf('async function refresh(')
+  // ⚠️ 窗口要够宽 —— 函数含大段「为什么」注释，3000 字符会截在说明里
+  //（我第一版就是 3000，导致「必须保留旧 extras」误报失败）。
+  const block = src.slice(i, i + 6000)
+  assert.ok(!/headers:\s*\{[^}]*Authorization/.test(block), '⚠️ 续期不得带 Authorization')
+  // ⚠️ keyfrom 必须用凭据里的**存储值**，不取当前时刻（对齐 Go 的 KeyfromBody）
+  assert.ok(/firstKeyfrom: credential\.extras\['first_keyfrom'\]/.test(block),
+    '⚠️ firstKeyfrom 要用存储值')
+  assert.ok(/latestKeyfrom: credential\.extras\['latest_keyfrom'\]/.test(block),
+    '⚠️ latestKeyfrom 要用存储值（Go 从不更新它）')
+  // ⚠️ extras 要合并保留（丢了 keyfrom ⇒ 下次续期永远失败）
+  assert.ok(/extras: \{ \.\.\.credential\.extras, \.\.\.next\.extras \}/.test(block),
+    '⚠️ 必须保留旧 extras')
+})
+
+test('⚠️ zcode / opencode / loomy 如实不提供 refresh（上游确实没有续期端点）', () => {
+  // ⚠️ 这三家是**诚实声明**，不是遗漏 —— 与上面两家（真缺陷）性质不同。
+  // 别为了「统一」硬加一个假续期（那会是不实承诺，UI 会显示「可自动续期」）。
+  //
+  // 依据（读了参考实现）：
+  // · zcode 「凭据是静态的，没有 refresh 端点」（`zcode-auth.ts:1765`）；
+  // · opencode 匿名通道凭据是字面量 `'public'`，**无凭据可续期**
+  //   （`opencode-auth.ts:175` 显式 `refreshable: false`）；
+  // · loomy 服务端**没有任何 refresh 端点**（`loomy-auth.ts:11`
+  //   `isLoomyRefreshable()` 恒 false）。
+  for (const [name, why] of [
+    ['zcode', '凭据静态/无 refresh 端点'],
+    ['opencode', '匿名通道无凭据可续期'],
+    ['loomy', '服务端无 refresh 端点'],
+  ] as const) {
+    const src = readFileSync(`src/providers/${name}.ts`, 'utf8')
+    assert.ok(!/^  refresh,$/m.test(src), `${name} 不应挂 refresh（${why}）`)
+  }
+  // 且 zcode 要**明说**不可续期（否则后人会以为是漏了）
+  const zcode = readFileSync('src/providers/zcode.ts', 'utf8')
+  assert.ok(/不可续期/.test(zcode), 'zcode 必须显式说明「不可续期」')
+})
+
+test('🔴 zcode 签到前**必须**补发客户端活跃上报（否则 preview 恒为空）', () => {
+  // ## 实测缺陷（我第一版漏了）
+  //
+  // 参考实现 `zcode-upstream.ts:18-29` 写得很明确：
+  // ```
+  // 补 POST /api/v1/event/report {app_launch, app_daily_active} 之前：
+  //   preview → {"code":0,"data":{"plans":[]}}          ← 空
+  // 补之后：
+  //   preview → {"code":0,"data":{"plans":[{plan_id:"…"}]}}
+  // ```
+  // ⚠️ 服务端**不会主动推送**活动，`preview` 的内容**依赖客户端活跃信号**。
+  //
+  // 我第一版直接查 preview ⇒ 永远拿空列表 ⇒ 把它当成「今天已领取」报给用户。
+  // **那是假结论**，比报错更糟：用户以为「已经领过了」，实际是我们**根本没查到**。
+  const src = readFileSync('src/providers/zcode.ts', 'utf8')
+  assert.ok(src.includes('ZCODE_EVENT_REPORT_URL'), '应有活跃上报端点常量')
+  const i = src.indexOf('async function checkin(')
+  const block = src.slice(i, i + 4000)
+  // ⚠️ 上报必须在**查 preview 之前**
+  const reportAt = block.indexOf('ZCODE_EVENT_REPORT_URL')
+  const previewAt = block.indexOf('ZCODE_BILLING_PREVIEW_URL')
+  assert.ok(reportAt > 0, 'checkin 里必须发活跃上报')
+  assert.ok(previewAt > 0, 'checkin 里要查 preview')
+  assert.ok(reportAt < previewAt, '⚠️ 上报必须在查 preview **之前**（否则查到的是空列表）')
+  // 两个事件都要发
+  assert.ok(block.includes("'app_launch'") && block.includes("'app_daily_active'"),
+    '两个活跃事件都要发')
+
+  // 🔴 preview **必须带** `app_version` 与 `platform=win32` 查询参数
+  //（参考实现 `zcode-upstream.ts:426` 逐字如此）。
+  assert.ok(/ZCODE_BILLING_PREVIEW_URL\}?app_version=/.test(block) || /app_version=\$\{encodeURIComponent/.test(block),
+    '⚠️ preview 必须带 app_version 查询参数')
+  assert.ok(block.includes('platform=win32'), '⚠️ preview 必须带 platform=win32')
+
+  // 🔴 判据必须是「`plan_id` 非空」，**不能**自己编「可领取」标记字段。
+  // ⚠️ 我第一版编了 `claimable`/`can_claim`/`available` 三个字段名去筛，
+  // 而上游**根本没有这些字段** ⇒ 列表恒为空 ⇒ 签到恒报「没有可领取的积分」
+  // ⇒ **假结论**（用户以为领过了，实际是我们筛错了）。
+  assert.ok(/\['plan_id'\]/.test(block), '⚠️ 判据必须读 plan_id')
+  // ⚠️ 判据要**排除注释** —— 我的说明注释里正引用了那三个臆造字段名
+  //（不排除会把「解释为什么不该用」的注释本身判成违规）。
+  const code = block.replace(/\/\*[\s\S]*?\*\//g, '').split('\n').filter((l) => !l.trim().startsWith('//')).join('\n')
+  assert.ok(!/claimable'\] === true|can_claim'\]|available'\] === true/.test(code),
+    '⚠️ 不得使用臆造的「可领取」标记字段（上游没有这些字段）')
+  // ⚠️ device_mid 必须用 EXTRA_* 常量取值 —— 存储键是 camelCase，
+  // 手写 snake_case 会读到 undefined ⇒ 发空串 ⇒ 上报静默失效。
+  assert.ok(/credential\.extras\[EXTRA_DEVICE_MID\]/.test(block),
+    '⚠️ device_mid 必须用 EXTRA_DEVICE_MID 常量（键名是 camelCase deviceMid）')
+  assert.ok(/credential\.extras\[EXTRA_APP_VERSION\]/.test(block),
+    '⚠️ app_version 必须用 EXTRA_APP_VERSION 常量')
+  // 上报失败不能阻塞签到
+  assert.ok(/catch \{[\s\S]{0,120}\}/.test(block.slice(reportAt - 200, reportAt + 2000)),
+    '上报失败应被兜住（不阻塞）')
+})
+
+test('🔴 qoder 排队必须有**总墙钟预算**（只有次数上限会让请求挂到被平台掐断）', () => {
+  // ## 实测缺陷
+  //
+  // 原先只有「次数上限」（3 次 × 最多 10s 等待 + 每次 20s 超时 ≈ 90s），
+  // **没有总时间上限**。实测后果：
+  // ```
+  // 排队 3 轮耗尽（约 90s）→ 触发续期（再 30s）
+  //   ⇒ 请求挂到 122s ⇒ Worker 报 `Network connection lost.`
+  //   ⇒ 平台回一个裸 `error code: 1101`（无任何可读原因）
+  // ```
+  //
+  // ⚠️ 参考实现默认等 **30 分钟**（`qoder-adapter.ts:167-172`）——
+  // 那是**长驻本地进程**的合理预算，而本服务跑在 Worker 里：
+  // 挂几分钟既会被平台掐断，用户也早已放弃。
+  const src = readFileSync('src/providers/qoder.ts', 'utf8')
+  assert.ok(/const QUEUE_TOTAL_BUDGET_MS = \d[\d_]*/.test(src), '必须有总预算常量')
+  const m = /const QUEUE_TOTAL_BUDGET_MS = ([\d_]+)/.exec(src)
+  const budget = Number(m![1]!.replaceAll('_', ''))
+  // ⚠️ 上限：不能长到被平台掐断（实测 122s 会挂）
+  assert.ok(budget <= 90_000, `总预算 ${budget}ms 太长，会被平台掐断（实测 122s 即失败）`)
+  // ⚠️ 下限：要够覆盖一次正常排队（实测常见 20–25s），否则正常用户会被误报
+  assert.ok(budget >= 30_000, `总预算 ${budget}ms 太短，正常排队（20–25s）会被误判为繁忙`)
+  // 循环里必须真的用上它
+  const i = src.indexOf('async function chat(')
+  const block = src.slice(i, i + 3000)
+  assert.ok(/DATE|Date\.now\(\) - queueStartedAt/.test(block), '要记录起始时刻')
+  assert.ok(/overBudget/.test(block), '⚠️ 必须有超预算判据')
+  // ⚠️ 排队超时要**如实说明是排队**，且标记为可重试（容量问题，换号/稍后有效）
+  assert.ok(/服务繁忙/.test(block) && /稍后重试/.test(block), '文案要说清是排队、稍后重试有效')
+  assert.ok(/retryable: true/.test(block), '⚠️ 排队是容量问题 ⇒ 应标可重试')
+})
+
+test('🔴 Worker 入口必须有异常边界（否则只回裸 `error code: 1101`）', () => {
+  // ## 实测缺陷
+  //
+  // 原先 `export default { fetch: handle }` 直接暴露业务函数，而 `handle`
+  // **完全没有 try/catch**。任何未捕获的抛出都变成 Cloudflare 的裸
+  // `error code: 1101`：客户端只看到 500 + 一个内部码，**不知道发生了什么**。
+  //
+  // ⚠️ 这与本项目「**绝不静默失败**」（§7.2）直接冲突 —— `1101` 就是
+  // 最彻底的静默失败：既没有原因，也没有可操作信息。
+  //
+  // ⚠️ 这条边界加上后**立刻**定位到了 qoder 的真实原因
+  //（`Network connection lost.`，此前完全不可见）。
+  const src = readFileSync('src/index.ts', 'utf8')
+  assert.ok(/async function handle\([\s\S]{0,120}?try \{/.test(src), '⚠️ handle 必须有 try')
+  assert.ok(/catch \(error\)/.test(src.slice(src.indexOf('async function handle('), src.indexOf('async function handle(') + 1200)),
+    '⚠️ handle 必须有 catch')
+  // 必须打**完整堆栈**（只打 message 会让排查失去线索）
+  const i = src.indexOf('async function handle(')
+  const block = src.slice(i, i + 1400)
+  assert.ok(/error\.stack/.test(block), '⚠️ 必须打完整堆栈')
+  // ⚠️ 回给客户端**可读原因**，不是裸内部码
+  assert.ok(/internal_error/.test(block), '应回可识别的错误码')
+  // ⚠️ 绝不能把 Authorization 打进日志。
+  // ⚠️ 判据要**排除注释** —— 我的说明注释里正写着「绝不打 Authorization」
+  //（不排除会把「解释为什么不打」的注释本身判成违规）。
+  const code = block.replace(/\/\*[\s\S]*?\*\//g, '').split('\n').filter((l) => !l.trim().startsWith('//')).join('\n')
+  assert.ok(!/Authorization/.test(code), '⚠️ 日志不得含 Authorization')
+})
+
+test('🔴 qoder 单次推理必须有**自己的超时**（只透传 signal = 永不超时）', () => {
+  // ## 实测缺陷（「加了总预算仍然 121.8s」的根因）
+  //
+  // 我加了「排队总墙钟预算」后**仍然**挂到 121.8s。原因：
+  // `postQoderInfer` 只透传 `request.signal`，**没有超时** ⇒
+  // **一次** fetch 就能无限期挂住 ⇒ 预算检查根本没机会执行
+  //（预算只能在「每次 infer **返回之后**」才被检查，而 infer 自己不返回）。
+  //
+  // ⚠️ **教训：加总预算前，必须确认每一段都有界。**
+  // 一个无界的子步骤会让外层所有预算形同虚设。
+  const src = readFileSync('src/providers/qoder.ts', 'utf8')
+  assert.ok(/const INFER_TIMEOUT_MS = \d[\d_]*/.test(src), '必须有推理超时常量')
+  const m = /const INFER_TIMEOUT_MS = ([\d_]+)/.exec(src)
+  const ms = Number(m![1]!.replaceAll('_', ''))
+  // 与参考实现的 `QODER_REQUEST_TIMEOUT_MS = 30_000` 一致
+  assert.equal(ms, 30_000, '应与参考实现的 30s 一致')
+  // ⚠️ **发起推理的那次 fetch** 必须用上它（不能只是定义）
+  const i = src.indexOf('async function postQoderInfer')
+  const j = src.indexOf('\n}', src.indexOf('return await fetch(', i))
+  const block = src.slice(i, j)
+  assert.ok(/AbortSignal\.timeout\(INFER_TIMEOUT_MS\)/.test(block),
+    '⚠️ 推理 fetch 必须带 AbortSignal.timeout(INFER_TIMEOUT_MS)')
+  assert.ok(/AbortSignal\.any\(\[request\.signal/.test(block),
+    '应与 request.signal 用 any 组合（客户端取消与超时都要生效）')
+})
+
+test('🔴 zcode 余额：`balances: []` **不是**异常，且要认顶层无 `data` 的形态', () => {
+  // ## 实测缺陷（用户报「商汤和 zcode 的账号怎么了，为什么不显示积分」）
+  //
+  // 线上实测上游原文是：
+  // ```json
+  // {"server_time":1791524120,"plans":[],"balances":[]}
+  // ```
+  // 两个问题叠在一起：
+  //
+  // ① **我们没有 `data` 包裹时也能解析** —— 参考实现的类型标注写的是
+  //    `data.balances`，但**实测响应根本没有 `data`**。我第一版只读
+  //    `parsed.data` ⇒ 恒判「缺少 data 字段」⇒ zcode 余额**永远查不出来**。
+  // ② **`balances: []` 是正常的** —— 参考实现实测记录
+  //    （`zcode-upstream.ts:338-348`）：
+  //    > **每日赠送的 start-plan 额度不在 `balances` 桶里**，只在 `plans` 里。
+  //    > 只读 `balances` ⇒ 面板显示 0，而用户实际能领 1 亿 tokens。
+  //    我第一版把「0 个桶」判成「形状无法识别」并**抛错** ⇒ 同样查不出。
+  const src = readFileSync('src/providers/zcode.ts', 'utf8')
+  const i = src.indexOf('async function balance(')
+  const block = src.slice(i, i + 5000)
+
+  // ① 必须兼容「顶层无 data」
+  assert.ok(/parsed\.balances \?\? parsed\.data\?\.balances/.test(block),
+    '⚠️ 必须同时认顶层与 data 两种层级（实测响应无 data 包裹）')
+  // ② 空桶**不能**抛错
+  assert.ok(!/packages\.length === 0[\s\S]{0,200}throw/.test(block),
+    '⚠️ 空桶不能抛错（那是正常形态，额度在 plans 里）')
+  // ③ 空桶时要去看 plans
+  assert.ok(/data\.plans/.test(block), '空桶时应回落到 plans（每日额度在那里）')
+  // ④ 必须符合 ProviderBalance 契约（没有 remaining/detail 这类自由字段）
+  assert.ok(!/remaining:\s*0/.test(block), '⚠️ 不得用 ProviderBalance 契约外的字段')
+})
+
+test('🔴 loomy 发验证码不能二次读 request body（否则号码永远被判非法）', () => {
+  // ## 实测缺陷（用户报「明明是 11 位电话号码但还是发不了验证码」）
+  //
+  // `/admin/providers/login/start` 在**开头**已经 `await request.json()`
+  // 解析过一次 body（拿 `provider` / `realm`）。而 loomy 分支里**又读了一次**
+  // `request.json()` —— HTTP 请求体是**一次性流**，第二次读会抛
+  // `TypeError: body used already`，被 `.catch(() => ({}))` 吞掉后
+  // `phone` 恒为 `''` ⇒ **任何号码都回「请填写 11 位手机号」**。
+  //
+  // ⚠️ 症状极具误导性：错误文案说的是「号码格式不对」，而真实原因是
+  // **我们没读到号码** —— 用户会反复检查自己输入的东西。
+  const src = readFileSync('src/index.ts', 'utf8')
+  const start = src.indexOf("path === '/admin/providers/login/start'")
+  // ⚠️ 范围要**只到下一个 `path ===`** —— `/login/loomy/sms` 是**另一个端点**，
+  // 它有权利读自己的 body。我第一版把范围切到文件末尾，把它也算进来了。
+  const after = src.slice(start + 10)
+  const nextPath = after.search(/path === '/)
+  const block = src.slice(start, start + 10 + (nextPath > 0 ? nextPath : 30000))
+  // ⚠️ 只数**代码**里的调用（注释里会引用这个缺陷，要排除）
+  const code = block.replace(/\/\*[\s\S]*?\*\//g, '').split('\n')
+    .filter((l) => !l.trim().startsWith('//')).join('\n')
+  const reads = (code.match(/request\.json\(\)/g) ?? []).length
+  assert.equal(reads, 1, `⚠️ login/start 只能读一次 request body（实际 ${reads} 次）—— 第二次会抛异常且被吞掉`)
+  // loomy 分支必须用已解析的 body
+  const li = code.indexOf("providerId === 'loomy'")
+  assert.ok(/body\.phone/.test(code.slice(li, li + 1500)), '⚠️ loomy 必须复用已解析的 body.phone')
+})
+
+test('⚠️ 续期失败的原因必须出现在用户可见错误里（不能只进日志）', () => {
+  // 用户报「商汤和 zcode 的账号怎么了，为什么调用不了」。
+  // 实测 codearts 返回的原始错误是 `APIG.0301 Incorrect IAM authentication
+  // Unauthorized` —— ⚠️ **极具误导性**：它说的是「IAM 鉴权不对」，
+  // 让人以为账号被封；而真实原因是**凭据缺自动续期材料/refresh token 已消耗**。
+  //
+  // 两者该采取的行动完全不同：前者等，后者去重新登录。
+  const src = readFileSync('src/gateway/server.ts', 'utf8')
+  assert.ok(/let refreshFailure = ''/.test(src), '要记录续期失败原因')
+  assert.ok(/refreshFailure = error instanceof Error/.test(src), '要在 catch 里记下来')
+  assert.ok(/自动续期也失败了：\$\{refreshFailure/.test(src),
+    '⚠️ 必须把原因附到用户可见的错误文案里')
+})
+
+test('🔴 读上游响应失败必须翻成 502 upstream_error（不能穿透成 500 internal_error）', () => {
+  // ## 实测缺陷（用户报「qoder 调用不了」，返回「服务内部错误」）
+  //
+  // provider 的**推理超时**（qoder `INFER_TIMEOUT_MS`）触发点**不在**
+  // `provider.chat()` 里 —— `chat()` 返回 `Response` 时**流还没读完**，
+  // 超时是在 `nonStreamingResponse` **读体时**炸的。
+  //
+  // 而那里原先只有 `try/finally`、**没有 `catch`** ⇒ 那个 `TimeoutError`
+  // 穿透整个 `handleProviderChat`（它的 try 只包了 `provider.chat` 调用）
+  // ⇒ 落到 Worker 异常边界 ⇒ 客户端看到 **`服务内部错误`**。
+  //
+  // ⚠️ 这是**错误分类**错误：上游慢/超时是**可重试的上游问题**，
+  // 不是我们的内部故障。报成 500 会让用户以为服务坏了。
+  const src = readFileSync('src/gateway/server.ts', 'utf8')
+  const i = src.indexOf('async function nonStreamingResponse')
+  const block = src.slice(i, i + 4000)
+  // 读体必须有 catch
+  assert.ok(/catch \(error\) \{[\s\S]{0,400}读取上游响应/.test(block),
+    '⚠️ 读体必须有 catch 并翻译成可读错误')
+  // ⚠️ 必须回 502 `upstream_error`，不是 500 `internal_error`
+  assert.ok(/'upstream_error'/.test(block), '⚠️ 应回 upstream_error 类型')
+  assert.ok(/status: 502/.test(block), '⚠️ 应是 502（上游问题），不是 500')
+  // ⚠️ 判据要**排除注释**（我的说明里正引用 `internal_error` 这个词）。
+  const code = block.replace(/\/\*[\s\S]*?\*\//g, '').split('\n')
+    .filter((l) => !l.trim().startsWith('//')).join('\n')
+  assert.ok(!/internal_error/.test(code), '⚠️ 不得报成 internal_error')
+  // ⚠️ 要参与记账（否则失败不入池状态：不换号、不冷却）
+  assert.ok(/hooks\.onError\(message\)/.test(block), '⚠️ 必须调 hooks.onError 参与记账')
+})

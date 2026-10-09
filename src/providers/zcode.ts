@@ -101,6 +101,14 @@ export const ZCODE_BILLING_CLAIM_URL = `${ZCODE_ORIGIN}/api/v1/zcode-plan/billin
  */
 export const ZCODE_BILLING_PREVIEW_URL = `${ZCODE_ORIGIN}/api/v1/zcode-plan/billing/preview`
 
+/**
+ * 客户端活跃上报端点（**不需要 Authorization**，但**需要 `X-Device-Mid`**）。
+ *
+ * ⚠️ 它**不是可选的**：签到前必须补发，否则 `preview` 恒返回空 `plans: []`。
+ * 见 `checkin()` 里的说明。
+ */
+export const ZCODE_EVENT_REPORT_URL = `${ZCODE_ORIGIN}/api/v1/event/report`
+
 /** CLI 设备授权流的初始化端点。 */
 export const ZCODE_OAUTH_CLI_INIT_URL = `${ZCODE_ORIGIN}/api/v1/oauth/cli/init`
 
@@ -324,7 +332,13 @@ export function buildZcodeSystemBlocks(
     ' - Is a git repository: no',
     ` - Platform: ${platform}`,
     ` - Shell: ${platform === 'win32' ? 'powershell' : 'bash'}`,
-    ` - OS Version: ${platform}`,
+    // ⚠️ 官方形态是 `<platform> <arch>`（参考实现 `zcode-identity.ts:183`：
+    // `${platform} ${process.arch}`）。我们此前只发 `linux`。
+    // ⚠️ **这本身不是 3012 的判据**（参考实现明说判据只有「身份块是否存在」），
+    // 但既然要贴近官方指纹，就逐字对齐 —— 少一个词就少一分「像官方客户端」。
+    // Workers 里没有 `process.arch`，官方客户端在 Windows 上是 win32 x64，
+    // 故这里显式写死 `win32 x64`（与请求头里硬编码的 `win32` 一致）。
+    ` - OS Version: ${options.platform ?? 'win32'} x64`,
     ` - You are powered by the model named ${provider}/${model}.`,
   ].join('\n')
 
@@ -948,13 +962,70 @@ async function checkin(
   credential: ProviderCredential,
   signal: AbortSignal,
 ): Promise<CheckinResult> {
-  // ① 先查可领取计划（**不需要 captcha**）—— 这步在 Workers 上真能跑通，
+  // ⓪ **先补发客户端活跃上报 —— 这一步不做，下面 preview 永远是空的。**
+  //
+  // ## 🔴 实测缺陷（我第一版漏了这一步）
+  //
+  // 参考实现 `zcode-upstream.ts:18-29` 写得很明确：
+  // ```
+  // 补 POST /api/v1/event/report {app_launch, app_daily_active} 之前：
+  //   preview → {"code":0,"data":{"plans":[]}}          ← 空
+  // 补之后：
+  //   preview → {"code":0,"data":{"plans":[{plan_id:"zcode-v3-start-plan-trust-…"}]}}
+  // ```
+  //
+  // ⚠️ **服务端不会主动推送活动**，`preview` 的内容**依赖客户端活跃信号**。
+  // 我第一版直接查 preview，于是永远拿到空列表，并把它当成
+  // 「今天已领取」报给用户 —— 那是一个**假结论**（比报错更糟：
+  // 用户以为「已经领过了」，实际是**我们根本没查到**）。
+  //
+  // ⚠️ 上报是**幂等**的（服务端按 `device_mid` + 日期去重），故每次签到前都补发。
+  // ⚠️ 上报**不需要 Authorization**，但**需要 `X-Device-Mid`**（缺则 400 code 3001）。
+  // ⚠️ 失败**不阻塞**：下一次调用会再补（参考实现同款处理）。
+  for (const event of ['app_launch', 'app_daily_active']) {
+    try {
+      await fetch(ZCODE_EVENT_REPORT_URL, {
+        method: 'POST',
+        headers: buildZcodeHeaders(credential, { json: true }),
+        body: JSON.stringify({
+          event,
+          // ⚠️ **必须用 EXTRA_* 常量取值** —— 存储键是 camelCase
+          //（`deviceMid` / `appVersion`），我第一版手写成 snake_case
+          //（`device_mid` / `app_version`）⇒ 读到 `undefined` ⇒ 发**空串**，
+          // 上报静默失效（上游按 device_mid 去重，空值等同没上报）。
+          // 这类「键名写错不报错、只是行为不对」的缺陷在本项目出现过多次，
+          // 故这里直接引用常量，不再手写字面量。
+          device_mid: credential.extras[EXTRA_DEVICE_MID] ?? credential.uid,
+          platform: 'win32',
+          app_version: credential.extras[EXTRA_APP_VERSION] ?? ZCODE_APP_VERSION_FALLBACK,
+        }),
+        signal: AbortSignal.any([signal, AbortSignal.timeout(20_000)]),
+      })
+    } catch {
+      // 上报失败不阻塞签到尝试 —— 上游可能只是瞬时抖动。
+    }
+  }
+
+  // ① 再查可领取计划（**不需要 captcha**）—— 这步在 Workers 上真能跑通，
   //    故即便后面 claim 失败，也能给用户一条有用信息。
   let claimable: string[] = []
   try {
-    const preview = await fetch(ZCODE_BILLING_PREVIEW_URL, {
+    // ⚠️ **必须带 `app_version` 与 `platform` 查询参数** —— 参考实现
+    //（`zcode-upstream.ts:426`）逐字是：
+    // `?app_version=<v>&platform=win32`
+    // 不带它们上游可能按「非官方客户端」处理而返回空列表。
+    const appVersion = credential.extras[EXTRA_APP_VERSION] ?? ZCODE_APP_VERSION_FALLBACK
+    const previewUrl =
+      `${ZCODE_BILLING_PREVIEW_URL}?app_version=${encodeURIComponent(appVersion)}&platform=win32`
+    // ⚠️ **不带 `Authorization`** —— 参考实现的端点表明确写着
+    // `GET /zcode-plan/billing/preview` 的「需要 Authorization」是 **否**
+    //（`zcode-upstream.ts:11-17`），且其代码逐字只传 `{ json: false }`
+    //（`zcode-upstream.ts:427-429`）。我第一版自作主张带了 Bearer，
+    // 属于偏离官方口径 —— 带上会让上游把这次查询当成**已登录会话**的
+    // 上下文处理，而官方的签到前查询本就在未登录语义下进行。
+    const preview = await fetch(previewUrl, {
       method: 'GET',
-      headers: buildZcodeHeaders(credential, { authorization: `Bearer ${credential.accessToken}`, json: false }),
+      headers: buildZcodeHeaders(credential, { json: false }),
       signal,
     })
     if (preview.ok) {
@@ -963,16 +1034,18 @@ async function checkin(
         | undefined
       const plans = body?.data?.plans
       if (Array.isArray(plans)) {
+        // 🔴 **判据是「`plan_id` 非空」，不是某个「可领取」标记。**
+        //
+        // ⚠️ 我第一版**自己编了** `claimable` / `can_claim` / `available` 三个
+        // 字段名去筛 —— 而上游**根本没有这些字段**（参考实现
+        // `zcode-upstream.ts:445-447` 的判据只有 `plan_id` 非空）。
+        // 后果：列表恒为空 ⇒ 签到恒报「没有可领取的积分」⇒
+        // **假结论**（用户以为领过了，实际是我们筛错了）。
+        // ⚠️ 教训：**字段名不能猜**，要去参考实现里逐字核对。
         claimable = plans
           .filter((x) => x !== null && typeof x === 'object')
-          .filter((x) => {
-            // ⚠️ 判据取「可领取」标记；上游字段名未在参考实现里固定，
-            // 故同时看几个可能的名字，任一为真即算。
-            const r = x as Record<string, unknown>
-            return r['claimable'] === true || r['can_claim'] === true || r['available'] === true
-          })
-          .map((x) => String((x as Record<string, unknown>)['plan_id'] ?? (x as Record<string, unknown>)['id'] ?? ''))
-          .filter((id) => id !== '')
+          .map((x) => (x as Record<string, unknown>)['plan_id'])
+          .filter((id): id is string => typeof id === 'string' && id !== '')
       }
     }
   } catch {
@@ -1044,12 +1117,35 @@ async function balance(credential: ProviderCredential, signal: AbortSignal): Pro
       message: `ZCode 余额查询失败：http=${res.status} ${text.slice(0, 200)}`,
     })
   }
+  // ⚠️ **响应可能没有 `data` 包裹**（实测）。
+  //
+  // 线上实测原文是：
+  // ```json
+  // {"server_time":1791524120,"plans":[],"balances":[]}
+  // ```
+  // 而参考实现的类型标注写的是 `data.balances`（`zcode-upstream.ts:271-277`）。
+  // ⇒ 两种形态都要认：**先看 `data`，没有就回落顶层**。
+  //
+  // ⚠️ 我第一版只读 `parsed.data` ⇒ 对上面这个真实响应恒判「缺少 data 字段」，
+  // 于是 zcode 的余额**永远查不出来**（面板显示错误、账号卡片无积分）。
+  // 这类「层级猜错」的缺陷不会报错得很难看，只会让功能静默失效。
   const parsed = (await res.json()) as {
-    data?: { displayMode?: unknown; balances?: unknown }
+    data?: { displayMode?: unknown; balances?: unknown; plans?: unknown }
+    displayMode?: unknown
+    balances?: unknown
+    plans?: unknown
   }
-  const data = parsed.data
-  if (data === undefined) {
-    throw new ProviderError({ provider: 'zcode', message: 'ZCode 余额响应缺少 data 字段' })
+  // 顶层与 `data` 里各字段取并集（顶层优先，因为实测顶层才是真实形态）
+  const data = {
+    displayMode: parsed.displayMode ?? parsed.data?.displayMode,
+    balances: parsed.balances ?? parsed.data?.balances,
+    plans: parsed.plans ?? parsed.data?.plans,
+  }
+  if (data.balances === undefined && data.plans === undefined) {
+    throw new ProviderError({
+      provider: 'zcode',
+      message: `ZCode 余额响应缺少 balances/plans 字段（原文：${JSON.stringify(parsed).slice(0, 200)}）`,
+    })
   }
   // ⚠️ 企业版不下发额度数字、只给外部链接 ⇒ **抛错说明**，不要显示成 0
   //（0 是「已用光」的语义，会误导用户）。
@@ -1088,14 +1184,47 @@ async function balance(credential: ProviderCredential, signal: AbortSignal): Pro
     total += bucketTotal
     if (expiryMs > 0 && (earliestExpiry === 0 || expiryMs < earliestExpiry)) earliestExpiry = expiryMs
   }
-  // ⚠️ 一个桶都没解析出来 → **抛错**（响应形状与预期不符），而不是返回 0。
+  // ## 🔴 `balances: []` **是正常的** —— 不能当异常抛
+  //
+  // 参考实现实测记录（`zcode-upstream.ts:338-348`）：
+  // ```
+  // GET /billing/balance → data.balances = []                       ← 0 个桶
+  // GET /billing/preview → data.plans[0].plan_id = …trust-1003
+  // ```
+  // > **每日赠送的 start-plan 额度不在 `balances` 桶里**，只在 `plans` 里。
+  // > 只读 `balances` ⇒ 面板显示 0，而用户实际能领 1 亿 tokens。
+  //
+  // ⚠️ 我第一版把「0 个桶」判成「形状无法识别」并抛错 ⇒
+  // zcode 余额**永远查不出**（账号卡片无积分、实时查询报错）。
+  // 正确做法：桶与 plans 都是空时，**如实返回 0**（真的没有额度），
+  // 只有「连字段都没有」才算形状异常（那已在上面判过）。
   if (packages.length === 0) {
-    throw new ProviderError({
-      provider: 'zcode',
-      message: `ZCode 余额响应形状无法识别（原文：${JSON.stringify(data).slice(0, 200)}）`,
-    })
+    // ⚠️ 顺带把 `plans` 里的可领额度也算进去 —— 那才是每日赠送额度的真实位置。
+    // （此处**只读展示**，不触发领取；`preview` 已在 checkin 路径里补过活跃上报。）
+    const rawPlans = Array.isArray(data.plans) ? data.plans : []
+    const planNames: string[] = []
+    for (const item of rawPlans) {
+      if (typeof item !== 'object' || item === null) continue
+      const rec = item as Record<string, unknown>
+      const planId = rec['plan_id']
+      if (typeof planId !== 'string' || planId === '') continue
+      const name = typeof rec['name'] === 'string' && rec['name'] !== '' ? rec['name'] : 'ZCode 每日额度'
+      const amount = num(rec['amount'])
+      planNames.push(amount !== undefined ? `${name}（${amount}）` : name)
+    }
+    // ⚠️ 用 `packages[].name` 承载说明 —— `ProviderBalance` 只有
+    // `total` / `expiring` / `earliestExpiry` / `packages` 四个字段，
+    // **没有自由文本字段**（参考实现里的 `detail` 不是本项目的契约）。
+    return {
+      total: 0,
+      expiring: 0,
+      earliestExpiry: 0,
+      packages: (planNames.length > 0
+        ? planNames.map((name) => ({ name: `可领：${name}`, amount: 0, expiry: 0 }))
+        : [{ name: '额度桶为空（当前没有可用额度，也没有可领活动）', amount: 0, expiry: 0 }]),
+    }
   }
-  return { total, expiring: 0, earliestExpiry, packages: packages.map((p) => ({ ...p, amount: p.amount })) }
+  return { total, expiring: 0, earliestExpiry, packages }
 }
 
 

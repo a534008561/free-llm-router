@@ -61,6 +61,7 @@ import type { AccountState } from './pool/state.js'
 import type { ProviderModel } from './providers/types.js'
 import type { LoginCredential } from './upstream/auth.js'
 import { parseAuthDocument, parseAuthPayload } from './upstream/import.js'
+import { handleResponses } from './gateway/responses.js'
 import { handleChatCompletions } from './gateway/server.js'
 import { fetchBalance } from './upstream/checkin.js'
 import { listTasks } from './upstream/tasks.js'
@@ -936,7 +937,56 @@ async function pollTraeLogin(
   return json(result)
 }
 
+/**
+ * Worker 的 `fetch` 入口 —— **带兜底的异常边界**。
+ *
+ * ## 🔴 为什么必须包这一层（实测缺陷）
+ *
+ * 原先 `export default { fetch: handle }` 直接暴露业务函数，而 `handle`
+ * **完全没有 try/catch**。于是任何一个未捕获的抛出（provider 里某个
+ * 解析分支、DO RPC、上游返回了意外形状…）都会变成 Cloudflare 的
+ * **裸 `error code: 1101`**：
+ *
+ * - 客户端只看到 `error code: 1101` + HTTP 500，**不知道发生了什么**；
+ * - 我们这边也拿不到可读原因（日志里只有 CF 的内部码）；
+ * - 实测触发场景：qoder 排队 3 轮耗尽后（约 122s）抛出的路径。
+ *
+ * ⚠️ 这与本项目「**绝不静默失败**」（§7.2）的纪律直接冲突 ——
+ * `1101` 就是最彻底的静默失败：既没有原因，也没有可操作信息。
+ *
+ * 故这里加一层边界：把抛出转成**带可读原因**的 500 JSON，
+ * 同时在日志里打出完整堆栈（`console.error` 会进 Workers Logs）。
+ *
+ * ⚠️ **只兜异常，不改行为**：正常路径一个字节都不受影响。
+ */
 async function handle(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  try {
+    return await handleInner(request, env, ctx)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    const stack = error instanceof Error ? (error.stack ?? '') : ''
+    // ⚠️ 打完整堆栈进 Workers Logs —— 否则排查时只剩一个 1101。
+    // 请求信息也打上（路径 + 方法），但**绝不打 Authorization**。
+    const url = (() => { try { return new URL(request.url) } catch { return undefined } })()
+    console.error(
+      `[unhandled] ${request.method} ${url?.pathname ?? '(bad url)'} → ${message}\n${stack}`,
+    )
+    // 回给客户端**可读原因**（而不是 `error code: 1101`）。
+    return new Response(
+      JSON.stringify({
+        error: {
+          message: `服务内部错误：${message}`,
+          type: 'internal_error',
+          code: 'internal_error',
+        },
+      }),
+      { status: 500, headers: { 'content-type': 'application/json; charset=utf-8' } },
+    )
+  }
+}
+
+/** 真正的业务路由（异常由上面的 {@link handle} 统一兜住）。 */
+async function handleInner(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url)
   const path = url.pathname
 
@@ -1136,7 +1186,9 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
   // 其余家即便声明了 `login: true` 也无法从本服务发起 —— 见各 provider 的
   // `capabilities.loginBlockedReason`（这是刻意如实声明的，不是遗漏）。
   if (path === '/admin/providers/login/start' && request.method === 'POST') {
-    const body = (await request.json().catch(() => ({}))) as { provider?: string; realm?: string }
+    const body = (await request.json().catch(() => ({}))) as {
+      provider?: string; realm?: string; phone?: string
+    }
     const providerId = body.provider ?? ''
     // ⚠️ 会话分片必须与**账号将要落入的分片**一致，否则轮询时找不到会话
     //（轮询按 realm 逐个分片查，见 `/admin/providers/login/poll`）。
@@ -1457,8 +1509,21 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     //（参考实现 `loomy-oauth.ts:141-144` 专门为此不返回空串）。
     if (providerId === 'loomy') {
       const { sendLoomySmsCode } = await import('./providers/loomy.js')
-      const reqBody = await request.json().catch(() => ({})) as { phone?: string }
-      const phone = typeof reqBody.phone === 'string' ? reqBody.phone.trim() : ''
+      // 🔴 **必须复用上面已经解析过的 `body`，不能再次 `request.json()`**。
+      //
+      // ## 实测缺陷（用户报「明明是 11 位号码却发不了验证码」）
+      //
+      // 原先这里写了 `await request.json()` **第二次**。而 HTTP 请求体是
+      // **一次性流** —— 第二次读会抛 `TypeError: body used already`
+      //（或 `Unexpected end of JSON input`），被 `.catch(() => ({}))` 吞掉后
+      // `phone` 恒为 `''` ⇒ **任何号码都被判「请填写 11 位手机号」**。
+      //
+      // ⚠️ 症状极具误导性：错误文案说的是「号码格式不对」，而真实原因是
+      // **我们没读到号码**。用户会反复检查自己输入的号码。
+      // ⚠️ 这类「静默吞掉解析异常」的写法正是本项目明令禁止的
+      //（AGENTS.md §7.2「失败必须显式」）—— `.catch(() => ({}))` 让一个
+      // 必然失败的操作看起来像「用户传了空值」。
+      const phone = typeof body.phone === 'string' ? body.phone.trim() : ''
       // ⚠️ 只做**最基本的**格式检查（11 位数字，1 开头）—— 详细的号码规则
       // 交给上游判（它才知道哪些号段可用）。这里拦的是明显的空值/乱填。
       if (!/^1\d{10}$/.test(phone)) {
@@ -2648,6 +2713,20 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     const result = await handleChatCompletions(request, env, realm, ctx)
     // ⚠️ 流式响应必须**原样返回** —— 不要在这里包装或缓冲，
     // 那会破坏逐字输出并可能超出 CPU 预算。
+    return result.response
+  }
+
+  // ── OpenAI **Responses API**（新一代客户端：Codex CLI 等） ──
+  //
+  // ⚠️ **与 `/v1/chat/completions` 并存**，不做「格式开关」：
+  // 客户端用哪套协议由它自己请求的 URL 决定。做成互斥开关只会让
+  // 「另一个协议的客户端在切换后突然失效」，而网关这边没有任何互斥的理由 ——
+  // 两者共用同一份 provider 路由、账号池与图片入站。
+  // 依据：参考实现 `openai-gateway/responses.ts:12-16`。
+  if (path === '/v1/responses' && request.method === 'POST') {
+    const realm = url.searchParams.get('realm') ?? 'cn'
+    const result = await handleResponses(request, env, realm, ctx)
+    // 同 Chat 路径：流式响应**原样返回**，不在这里包装或缓冲。
     return result.response
   }
 
