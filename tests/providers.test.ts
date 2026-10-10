@@ -14,7 +14,7 @@
  */
 
 import { test } from 'node:test'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import assert from 'node:assert/strict'
 
 import {
@@ -54,6 +54,24 @@ function catchError(fn: () => unknown): Error | undefined {
 }
 
 // ─────────────────── 模型名路由 ───────────────────
+
+/**
+ * 去掉 TS 源码里的 `//` 行注释与 `/* *\/` 块注释。
+ *
+ * ⚠️ **本文件的断言大量基于源码文本 grep，必须先剥注释** ——
+ * 本项目的注释习惯是逐字引用缺陷原文（含 `hooks.onError(message)`
+ * 这类**代码字面量**），不剥注释时注释会先于真正的代码命中，
+ * 产生「顺序反了 / 找不到」这类**假失败**。我已为此返工两次。
+ *
+ * ⚠️ 这是**粗略**剥离：不处理字符串里的 `//`（本文件断言的代码里没有这种写法）。
+ */
+function stripComments(source: string): string {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n')
+    .filter((line) => !line.trim().startsWith('//'))
+    .join('\n')
+}
 
 test('无前缀的裸模型名回落到默认供应商（保持既有用户兼容）', () => {
   // 本项目既有用户已经在用 `deepseek-v4-flash`，不能因为多供应商就要求加前缀
@@ -843,9 +861,17 @@ test('🔴 读上游响应失败必须翻成 502 upstream_error（不能穿透�
   // 不是我们的内部故障。报成 500 会让用户以为服务坏了。
   const src = readFileSync('src/gateway/server.ts', 'utf8')
   const i = src.indexOf('async function nonStreamingResponse')
-  const block = src.slice(i, i + 4000)
+  assert.ok(i > 0, '必须能找到 nonStreamingResponse')
+  // ⚠️ 窗口取到**文件末尾**：`nonStreamingResponse` 是本文件最后一个函数。
+  // 用固定长度（我原先写 4000）会在注释变长后**切掉真正的代码**，
+  // 让断言变成「找不到 ⇒ 失败」这种**假失败**（加完 clientGone 说明后就踩到了）。
+  // ⚠️ **必须剥掉注释再断言。**
+  // 本项目所有解释性注释都用中文详细引用缺陷原文 —— 包括
+  // `hooks.onError(message)` 这种**代码字面量**。不剥注释时，注释会先于
+  // 真正的代码命中 grep，产生「顺序反了」这种**假失败**（我为此返工两次）。
+  const block = stripComments(src.slice(i))
   // 读体必须有 catch
-  assert.ok(/catch \(error\) \{[\s\S]{0,400}读取上游响应/.test(block),
+  assert.ok(/catch \(error\) \{[\s\S]{0,600}读取上游响应/.test(block),
     '⚠️ 读体必须有 catch 并翻译成可读错误')
   // ⚠️ 必须回 502 `upstream_error`，不是 500 `internal_error`
   assert.ok(/'upstream_error'/.test(block), '⚠️ 应回 upstream_error 类型')
@@ -856,4 +882,362 @@ test('🔴 读上游响应失败必须翻成 502 upstream_error（不能穿透�
   assert.ok(!/internal_error/.test(code), '⚠️ 不得报成 internal_error')
   // ⚠️ 要参与记账（否则失败不入池状态：不换号、不冷却）
   assert.ok(/hooks\.onError\(message\)/.test(block), '⚠️ 必须调 hooks.onError 参与记账')
+})
+
+test('🔴 saveLoginSession 的第三个参数必须是**绝对时刻**（不是时长）', () => {
+  // ## 实测缺陷（用户报「讯飞登录显示登录会话不存在或已过期」）
+  //
+  // `saveLoginSession(state, payload, expiresAt)` 的第三个参数**必须是
+  // `Date.now() + TTL` 形态的绝对毫秒时间戳**（见 `AccountPoolDO.ts:767-769`
+  // → `writeLoginSession` 直接拿它比 `now`）。
+  //
+  // ⚠️ 我原先写的是裸的 `5 * 60 * 1000`（= 300000）—— 那是一个
+  // **1970-01-01T00:05:00Z** 的时刻 ⇒ 会话**存进去就已经过期**
+  // ⇒ 第二步必然报「会话不存在或已过期」，而第一步明明刚成功、验证码也真的发出去了。
+  //
+  // ⚠️ 这个参数名是 `expiresAt`（**时刻**）而非 `ttl`（**时长**）——
+  // 凡是「传时长还是时刻」的接口都极易写错，且症状是**静默失效**
+  //（不报错，只是永远查不到）。故这里用单测把所有调用点钉住。
+  const src = readFileSync('src/index.ts', 'utf8')
+  const calls: string[] = []
+  const re = /saveLoginSession\(/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(src)) !== null) {
+    // 从该位置往后配平括号，取出整个调用
+    let depth = 1
+    let k = m.index + 'saveLoginSession('.length
+    while (k < src.length && depth > 0) {
+      if (src[k] === '(') depth += 1
+      else if (src[k] === ')') depth -= 1
+      k += 1
+    }
+    calls.push(src.slice(m.index, k))
+  }
+  assert.ok(calls.length >= 10, `应找到全部调用点（找到 ${calls.length}）`)
+
+  for (const call of calls) {
+    // 取**最后一个顶层参数**
+    const body = call.slice(call.indexOf('(') + 1, -1)
+    const parts: string[] = []
+    let d = 0
+    let cur = ''
+    for (const c of body) {
+      if ('([{'.includes(c)) d += 1
+      else if (')]}'.includes(c)) d -= 1
+      if (c === ',' && d === 0) { parts.push(cur.trim()); cur = '' } else cur += c
+    }
+    // ⚠️ 收尾的 `cur` **必须** push（我的 JS 版原先在循环里 push 了，
+    // 但 Python 原型漏了 —— 这里保证补上，否则最后一个参数会丢）。
+    if (cur.trim() !== '') parts.push(cur.trim())
+    const third = parts[parts.length - 1] ?? ''
+    // ⚠️ 判据：必须含「时刻」语义的表达式。
+    // 合法形态：`Date.now() + …` / `expiresAt` / `now + …` / `…TTL` / `deadline + …`
+    const ok = /Date\.now\(\)|expiresAt|now \+|TTL|deadline|sessionTtl/.test(third)
+    assert.ok(
+      ok,
+      `⚠️ saveLoginSession 第 3 参数必须含「绝对时刻」语义（实际：${third.slice(0, 60)}）`
+        + ' —— 传裸时长会让会话**存进去就过期**，症状是「会话不存在」',
+    )
+  }
+})
+
+test('🔴 loomy 第二步必须复用 findLoginSession（不能自己解析 getLoginSession 的返回值）', () => {
+  // ## 实测缺陷（同上）
+  //
+  // `getLoginSession()` 返回的是**会话载荷本身**（`AccountPoolDO.ts:776-779`），
+  // 而 `findLoginSession()`（`index.ts:376-392`）才把它包成
+  // `{realm, payload: session, pool}`。
+  //
+  // ⚠️ 我原先自己写了个查找循环，还去取 `hit.payload` —— **那一层不存在**
+  // ⇒ 恒为 `undefined` ⇒ 第二步必然「会话不存在」。
+  //
+  // ⚠️ 教训：**同一个查找逻辑已有共享实现时，不要自己再写一遍** ——
+  // 我把「包装层的形状」搞错了，而这类错误只表现为「查不到」。
+  const src = readFileSync('src/index.ts', 'utf8')
+  const i = src.indexOf("path === '/admin/providers/login/loomy/sms'")
+  const block = src.slice(i, i + 4000)
+  assert.ok(/await findLoginSession\(env, state\)/.test(block),
+    '⚠️ loomy 第二步必须用 findLoginSession（它才是那个包装层）')
+  assert.ok(!/for \(const r of \[/.test(block),
+    '⚠️ 不得自己再写一遍分片查找循环')
+})
+
+test('🔴 cron 必须做**主动续期**（否则每次凭据过期都先失败一批请求）', () => {
+  // ## 用户报「其它账号的稳定性能不能提升一下，动不动就掉登录」
+  //
+  // 在此之前本项目续期**只有一条路径**：网关收到 401/403 时**才**续期。
+  // ⇒ **每一次凭据过期都必然先失败一批请求** ⇒ 用户看到「动不动就掉登录」，
+  // 而且掉的时候是**硬失败**（要等客户端重试才恢复）。
+  //
+  // ⚠️ 参考实现为此专门有 `refresh-scheduler.ts`，`refresh.ts:1` 写明：
+  // > 在凭据过期前**提前 1 小时**触发刷新（对齐真实插件的 `36e5`）。
+  //
+  // 本服务 cron 恰好**每小时一条**，天然是「提前量」的载体。
+  const src = readFileSync('src/index.ts', 'utf8')
+
+  // ① 必须有提前量与续期函数
+  assert.ok(/const REFRESH_LEAD_MS = 3_600_000/.test(src),
+    '提前量必须是 1 小时（对齐参考实现 REFRESH_LEAD_MS）')
+  assert.ok(/async function refreshExpiringCredentials/.test(src), '必须有主动续期函数')
+
+  // ② ⚠️ **必须在 cron 的「非任务时点 return」之前调用** ——
+  // 否则非任务时点就不会续期，而那正是「保持登录态」的关键。
+  const sched = src.slice(src.indexOf('async function scheduled('))
+  const callAt = sched.indexOf('await refreshExpiringCredentials(')
+  const returnAt = sched.indexOf('if (plan === undefined)')
+  assert.ok(callAt > 0, 'cron 里必须调用主动续期')
+  assert.ok(returnAt > 0, 'cron 里应有「非任务时点直接返回」的分支')
+  assert.ok(callAt < returnAt,
+    '⚠️ 主动续期必须在「非任务时点 return」**之前** —— 否则非任务时点永远不续期')
+
+  // ③ ⚠️ 只对**有 refresh 能力**的家动手（否则是「不实承诺」+ 白打上游）
+  const fn = src.slice(src.indexOf('async function refreshExpiringCredentials'))
+  assert.ok(/provider\?\.refresh === undefined\) continue/.test(fn),
+    '⚠️ 没有 refresh 的家必须跳过（zcode/opencode/loomy 无可续期之物）')
+  // ④ ⚠️ `expiresAt === 0` 表示**未知**而非「已过期」，不能拿它去续期
+  assert.ok(/Number\.isFinite\(expiresAt\) \|\| expiresAt <= 0\) continue/.test(fn),
+    '⚠️ expiresAt 为 0/NaN（未知）时必须跳过，不能当成已过期')
+  // ⑤ ⚠️ 逐账号 try（一个坏凭据不该让全场不续期）
+  assert.ok(/catch \(error\)[\s\S]{0,300}主动续期失败/.test(fn),
+    '⚠️ 必须逐账号兜错，否则一个失败会让后面全部不续期')
+  // ⑥ ⚠️ 整体也不能让 cron 抛（否则任务分发一起停）
+  assert.ok(/catch \(error\)[\s\S]{0,200}主动续期整体失败/.test(sched),
+    '⚠️ 续期整体失败不能让 cron 抛出（否则任务分发一起停）')
+  // ⑦ 停用的账号不续期（用户明确不用了）
+  assert.ok(/if \(account\.disabled\) continue/.test(fn), '停用账号应跳过')
+})
+
+test('🔴 每家 provider 都必须有 matchesShape（否则自动识别永远轮不到它）', () => {
+  // ## 实测缺陷（用户报「我在本地登录了 lobsterai，推送上去试试」）
+  //
+  // 导入后 LobsterAI 的凭据被判成了 **raccoon**（账号以 `raccoon:116092` 出现）。
+  //
+  // 根因：`parseCredentialAnywhere` 的循环里，`matchesShape === undefined`
+  // 会被当成「对象的字段形状不属于该供应商」而**直接跳过**
+  //（`src/providers/index.ts:170-176`）。
+  //
+  // - Raccoon 的判据是「`user_id` 是纯数字」；
+  // - **LobsterAI 的 `user_id` 恰好也是纯数字**（`116092`）；
+  // - 而 LobsterAI 当时**没有 `matchesShape`** ⇒ 被跳过 ⇒ 落到 Raccoon 手里。
+  //
+  // ⚠️ **教训：任何支持「凭据导入」的供应商都必须有 `matchesShape`。**
+  // 这类缺陷的症状是「导入成功但一发消息就 401」/「账号出现在别家下面」——
+  // 用户很难联想到判别式缺失。
+  //
+  // 本测试**动态**遍历注册表，新增供应商若忘了加判别式会立刻失败。
+  const src = readFileSync('src/providers/index.ts', 'utf8')
+  const registry = src.slice(src.indexOf('export const PROVIDERS'))
+  const ids = [...registry.matchAll(/^\s{2}(\w+Provider),$/gm)].map((m) => m[1])
+  assert.ok(ids.length >= 12, `应解析出全部 provider（实际 ${ids.length}）`)
+
+  const missing: string[] = []
+  for (const name of ids) {
+    // provider 的实现文件与变量名的对应：去掉结尾的 Provider 并转小写
+    const base = name.replace(/Provider$/, '').toLowerCase()
+    const file = `src/providers/${base}.ts`
+    if (!existsSync(file)) continue
+    const body = readFileSync(file, 'utf8')
+    // ⚠️ 两种挂载形态都算：`matchesShape(input) {` 与 `matchesShape: xxx,`
+    if (!/^\s*matchesShape[(:]/m.test(body)) missing.push(`${name} (${file})`)
+  }
+  assert.deepEqual(
+    missing,
+    [],
+    '⚠️ 以下 provider 缺 matchesShape，自动识别时会被跳过、凭据被别家认走：'
+      + missing.join('、'),
+  )
+})
+
+test('🔴 lobsterai 必须被识别为 lobsterai，而不是 raccoon', () => {
+  // 实测：LobsterAI 凭据（`user_id` 为纯数字 `116092`）被判成了 raccoon。
+  const raccoon = readFileSync('src/providers/raccoon.ts', 'utf8')
+  const lobster = readFileSync('src/providers/lobsterai.ts', 'utf8')
+
+  // ① raccoon 必须**显式排除** LobsterAI 的独有字段
+  const rMatch = raccoon.slice(raccoon.indexOf('matchesShape('))
+  const rBody = rMatch.slice(0, rMatch.indexOf('\n  },'))
+  for (const k of ['first_keyfrom', 'latest_keyfrom']) {
+    assert.ok(
+      rBody.includes(k),
+      `⚠️ raccoon 的判别式必须排除 LobsterAI 的独有字段 \`${k}\``
+        + '（两者 user_id 都是纯数字，不排除就会误判）',
+    )
+  }
+
+  // ② lobsterai 必须有 matchesShape，且认自己的独有字段
+  assert.ok(/^\s*matchesShape\(/m.test(lobster), '⚠️ lobsterai 必须有 matchesShape')
+  const lMatch = lobster.slice(lobster.indexOf('matchesShape('))
+  const lBody = lMatch.slice(0, lMatch.indexOf('\n  },'))
+  assert.ok(lBody.includes('first_keyfrom'), '⚠️ lobsterai 的判别式应认 first_keyfrom')
+  // ③ 也要排除 TRAE（有 machine_id 且无 uuid）—— 与 parseCredential 口径一致
+  assert.ok(/machine_id/.test(lBody), '⚠️ lobsterai 的判别式必须排除 TRAE 凭据')
+})
+
+test('⚠️ loomy 的 matchesShape 与 parseCredential 必须共用同一份判据', () => {
+  // 两处判据一旦分叉，就会出现「matchesShape 说是我、parseCredential 说不是」
+  // 这种自相矛盾的组合，症状是「自动识别选中了 Loomy，导入却报错」。
+  const src = readFileSync('src/providers/loomy.ts', 'utf8')
+  assert.ok(/export function looksLikeLoomyCredential/.test(src),
+    '必须有共享判据函数')
+  // parseCredential 内部必须复用它
+  const pi = src.indexOf('function parseCredential(')
+  const pBody = src.slice(pi, pi + 6000)
+  assert.ok(/looksLikeLoomyCredential\(source\)/.test(pBody),
+    '⚠️ parseCredential 必须复用共享判据，不能自己再写一份')
+  // provider 对象必须挂它
+  assert.ok(/matchesShape: looksLikeLoomyCredential/.test(src),
+    '⚠️ matchesShape 必须复用同一个函数')
+  // ⚠️ 嵌套包装层也要认（否则嵌套形凭据永远判不出来）
+  const fn = src.slice(src.indexOf('export function looksLikeLoomyCredential'))
+  assert.ok(/for \(const wrapper of \['credential', 'credentials', 'auth'\]\)/.test(fn),
+    '⚠️ 共享判据必须先展开嵌套包装层（与 parseCredential 一致）')
+})
+
+test('🔴 空响应必须显式报错（含「找不到错误帧」的兜底），但**不能**误伤工具调用', () => {
+  // ## 实测缺陷（用户报「codearts 调用不了」）
+  //
+  // CodeArts 在「并发会话数已达上限(3个)」时，非流式路径回的是
+  //   `content:'' + finish_reason:'stop' + usage:null` 的 **HTTP 200 空答案**，
+  // 而它在**流式**路径是会正常报错的 —— 两条路径口径不一致。
+  //
+  // 根因有**两处**：
+  //
+  // 1. 判据里有个错误的合取项
+  //    `&& (completion.usage === undefined || completion.usage === null)` ——
+  //    它把「有 usage」当成「不是空响应」的理由。而 `usage` 只说「上游计了费」，
+  //    与「有没有内容」**无关**：最需要报错的恰恰是「消耗了 token 却没产出内容」。
+  // 2. 即使进了那个分支，**只有识别到错误帧才报错**；上游若给的是
+  //    「合法但完全空」的响应（没有错误帧、也没有内容），流程会**落回正常返回**
+  //    ⇒ 客户端拿到 `content:''`，看起来像「模型说了空话」。
+  //
+  // ⚠️ 这是本项目 §7.2「失败必须显式」明确禁止的形态：**空回复比报错更糟**。
+  const src = readFileSync('src/gateway/server.ts', 'utf8')
+  const i = src.indexOf('async function nonStreamingResponse')
+  const block = src.slice(i, i + 8000)
+
+  // ① 判据不得把 usage 当「有内容」的判据
+  // ⚠️ 判据要**排除注释**（我的说明里正引用那个错误写法作反面教材）。
+  const code = block.replace(/\/\*[\s\S]*?\*\//g, '').split('\n')
+    .filter((l) => !l.trim().startsWith('//')).join('\n')
+  assert.ok(
+    !/completion\.usage === undefined \|\| completion\.usage === null/.test(code),
+    '⚠️ 空响应判据不得包含 usage 条件（usage 只说明计了费，与内容无关）',
+  )
+
+  // ② 必须有「找不到错误帧也要报错」的兜底
+  assert.ok(/上游返回了空响应（既没有正文\/思考内容，也没有可识别的错误帧）/.test(block),
+    '⚠️ 必须有兜底：找不到错误帧时也要如实报错，不能落回静默空回复')
+
+  // ③ ⚠️ 但**必须排除工具调用** —— 那时 content 也是 ''，不排除会把一次
+  //    **成功**的工具调用误报成空响应（假阳性比原缺陷更糟：工具调用是
+  //    agent 场景的主路径）。
+  assert.ok(/const hasToolCalls = Array\.isArray\(toolCalls\) && toolCalls\.length > 0/.test(block),
+    '必须计算 hasToolCalls')
+  assert.ok(/choice !== undefined\s*\n\s*&& !hasToolCalls/.test(block),
+    '⚠️ 空响应判据必须排除 tool_calls（否则误伤正常的工具调用）')
+})
+
+test('⚠️ aggregateSse 确实会把 tool_calls 放进 message（上一条测试的前提）', () => {
+  // 上面那条测试断言「必须排除 tool_calls」，其前提是聚合结果里
+  // tool_calls 真的在 `choice.message.tool_calls`（而不是别处）。
+  // 这个前提若变了，那条断言就会变成**无意义的空转**。
+  const src = readFileSync('src/gateway/stream.ts', 'utf8')
+  assert.ok(/if \(toolCalls\.length > 0\) choice\.message\.tool_calls = toolCalls/.test(src),
+    '⚠️ aggregateSse 必须把 tool_calls 挂在 choice.message 上')
+  assert.ok(/finish_reason = toolCalls\.length > 0 \? 'tool_calls' : 'stop'/.test(src),
+    "⚠️ 有工具调用时 finish_reason 应为 'tool_calls'")
+})
+
+test('🔴 客户端取消**不得**记成账号失败（否则用户的取消会熔断健康账号）', () => {
+  // ## 代码审查发现的真缺陷（我自己上一轮引入的）
+  //
+  // 我给 `nonStreamingResponse` 加的读体 catch 里**无条件**调
+  // `hooks.onError(message)`。但那 catch 也会捕获**客户端中途取消**
+  //（用户点停止 / 关标签页 / 客户端超时）：那同样会让上游流 abort、
+  // `reader.read()` 抛 `AbortError`。
+  //
+  // ⇒ 一个**健康账号**会因用户的取消动作被记一次失败，而
+  // `punishmentForStreamError` 对非 11128 的错误一律返回 `'breaker'`
+  // ⇒ **3 次就把好号熔断 30 分钟**。症状正是本项目反复踩到的
+  //「账号明明好的，却越来越用不了」。
+  //
+  // ⚠️ 本项目**已有**这条纪律（`qoder.ts:924`、`zcode.ts:752` 都显式把
+  //「请求已被客户端取消」原样区分开），且流式路径**已经**用
+  // `hooks.clientGone?.()` 做这个判别 —— 非流式路径此前漏了同一条判据。
+  const src = readFileSync('src/gateway/server.ts', 'utf8')
+
+  // ① 非流式读体 catch 里必须有 clientGone 分支，且在 onError **之前**
+  const i = src.indexOf('async function nonStreamingResponse')
+  assert.ok(i > 0, '必须能找到 nonStreamingResponse')
+  // ⚠️ 同上：取到文件末尾，不用固定长度窗口（否则注释一长就产生假失败）。
+  // ⚠️ 同上：必须剥注释（我的说明里正引用 `hooks.onError(message)` 这个字面量，
+  // 不剥就会让「注释里的 onError」排在真正的代码之前 ⇒ 假失败）。
+  const block = stripComments(src.slice(i))
+  const goneAt = block.indexOf('const clientGone = hooks.clientGone?.() === true')
+  const onErrAt = block.indexOf('hooks.onError(message)')
+  assert.ok(goneAt > 0, '⚠️ 非流式读体失败必须先用 clientGone 判别客户端取消')
+  assert.ok(onErrAt > 0, '应有 hooks.onError 调用')
+  assert.ok(goneAt < onErrAt,
+    '⚠️ clientGone 判别必须在 hooks.onError **之前**（否则取消仍会被记成失败）')
+
+  // ② 取消分支必须**不**调 onError —— 即那个 return 要出现在 onError 之前
+  const cancelReturn = block.indexOf('client_closed_request')
+  assert.ok(cancelReturn > 0 && cancelReturn < onErrAt,
+    '⚠️ 客户端取消分支必须在 onError 之前 return（不记失败）')
+
+  // ③ hooks 类型必须声明 clientGone（否则调用点传了也拿不到）
+  assert.ok(/clientGone\?: \(\) => boolean/.test(block.slice(0, 600)),
+    '⚠️ nonStreamingResponse 的 hooks 类型必须声明 clientGone')
+
+  // ④ ⚠️ **所有** streamResponse 调用点都要传 clientGone。
+  // 只传一个等于没修：其余路径 clientGone?.() 返回 undefined ⇒ 仍会记失败。
+  const sites = [...src.matchAll(/await streamResponse\(/g)].map((m) => m.index)
+  assert.ok(sites.length >= 4, `应有 4 个 streamResponse 调用点（实际 ${sites.length}）`)
+  const missing: number[] = []
+  sites.forEach((at, n) => {
+    // 该调用点往后 1200 字符内应出现 clientGone
+    const scope = src.slice(at, at + 1200)
+    if (!scope.includes('clientGone')) missing.push(n + 1)
+  })
+  assert.deepEqual(missing, [],
+    `⚠️ 第 ${missing.join('、')} 个 streamResponse 调用点没传 clientGone`
+      + '（漏传的路径仍会把客户端取消记成账号失败）')
+})
+
+test('🔴 SSE `data:` 前缀必须容忍**无空格**形态（否则扫不到上游错误帧）', () => {
+  // ## 实测缺陷（全供应商验收时定位）
+  //
+  // codearts 经华为 APIG 回的错误帧原文是：
+  // ```
+  // data:{"error_code":"InferHub.4004.200","error_msg":"benefit not found",...}
+  // ```
+  // ⚠️ 注意 **`data:` 后面没有空格**。
+  //
+  // 而非流式路径「找不到内容时回头扫错误帧」那段原先判的是
+  // `line.startsWith('data: ')`（**带空格**）⇒ 这一帧**永远匹配不上**
+  // ⇒ 用户看到通用兜底「上游返回了空响应…」，而**真实原因是 benefit not found**
+  //（账号权益未生效 —— 该采取的行动完全不同）。
+  //
+  // ⚠️ 关键在于：**同一个项目里 `parseSseLine` 早就同时容忍两种写法**，
+  // 而我在 server.ts 里又手写了一遍解析，就漏掉了无空格形态。
+  // ⇒ **教训：SSE 一律走 `parseSseLine`，不要手写 `data:` 前缀判断。**
+  const server = readFileSync('src/gateway/server.ts', 'utf8')
+  const stream = readFileSync('src/gateway/stream.ts', 'utf8')
+
+  // ① parseSseLine 本身必须容忍无空格（这是前提）
+  assert.ok(/if \(!trimmed\.startsWith\('data:'\)\)/.test(stream),
+    "⚠️ parseSseLine 必须用 startsWith('data:')（不带空格）")
+  assert.ok(/trimmed\.slice\(5\)\.trim\(\)/.test(stream),
+    '⚠️ parseSseLine 应用 slice(5) 去掉 data: 并 trim')
+
+  // ② server.ts 里**不得**再手写 `startsWith('data: ')`（剥注释后判）
+  const code = stripComments(server)
+  assert.ok(!/startsWith\('data: '\)/.test(code),
+    "⚠️ 不得手写 startsWith('data: ')（带空格）—— 会漏掉上游的 `data:{...}` 形态")
+
+  // ③ 那段错误帧扫描必须复用 parseSseLine
+  const i = server.indexOf('async function nonStreamingResponse')
+  const block = stripComments(server.slice(i))
+  assert.ok(/const frame = parseSseLine\(line\)/.test(block),
+    '⚠️ 错误帧扫描必须复用 parseSseLine（同一件事只能有一个实现）')
 })

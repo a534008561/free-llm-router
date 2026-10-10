@@ -583,6 +583,9 @@ export async function handleChatCompletions(
     const startedAt = Date.now()
     return {
       response: await streamResponse(upstream.body, {
+        // ⚠️ 诊断 + 记账分界：客户端断开**不得**记成账号失败
+        //（否则用户的取消动作会熔断健康账号，见 `nonStreamingResponse` 的说明）。
+        clientGone: () => request.signal.aborted,
         onFirstChunk: () => {
           // 首帧到达即算成功（清熔断/降权）
           const okTask = pool.noteSuccess(candidate.uid, Date.now()).catch(() => {})
@@ -950,6 +953,9 @@ async function handleProviderChat(input: {
             const startedAt2 = Date.now()
             return {
               response: await streamResponse(retry.body, {
+                // ⚠️ 诊断 + 记账分界：客户端断开**不得**记成账号失败
+                //（否则用户的取消动作会熔断健康账号，见 `nonStreamingResponse` 的说明）。
+                clientGone: () => request.signal.aborted,
                 onFirstChunk: () => {
                   const t = pool.noteSuccess(picked.uid, Date.now()).catch(() => {})
                   if (ctx !== undefined) ctx.waitUntil(t)
@@ -1125,6 +1131,9 @@ async function handleProviderChat(input: {
 
     return {
       response: await streamResponse(upstream.body, {
+        // ⚠️ 诊断 + 记账分界：客户端断开**不得**记成账号失败
+        //（否则用户的取消动作会熔断健康账号，见 `nonStreamingResponse` 的说明）。
+        clientGone: () => request.signal.aborted,
         onFirstChunk: () => {
           const t = pool.noteSuccess(picked.uid, Date.now()).catch(() => {})
           if (ctx !== undefined) ctx.waitUntil(t)
@@ -1274,6 +1283,14 @@ async function nonStreamingResponse(
     onFirstChunk: () => void
     onError: (message: string) => void
     onFinish?: (usage: { input: number; output: number } | undefined) => void
+    /**
+     * ⚠️ **诊断用**：客户端是否已断开（`request.signal.aborted`）。
+     *
+     * 与流式路径的 `hooks.clientGone` 同一用途 —— 这是「客户端取消」与
+     * 「上游失败」的**唯一分界**。非流式路径读体时同样需要它：
+     * 不分清就会把用户的取消动作记成账号失败，进而熔断健康账号。
+     */
+    clientGone?: () => boolean
   },
 ): Promise<Response> {
   const reader = upstreamBody.getReader()
@@ -1306,6 +1323,36 @@ async function nonStreamingResponse(
     }
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error)
+    // ## 🔴 必须区分「客户端断开」与「上游失败」
+    //
+    // ⚠️ 我第一版**无条件**调 `hooks.onError(message)`，那是错的：
+    // 客户端中途取消（用户点了停止 / 关了标签页 / 客户端超时）同样会让
+    // 上游流 abort、`reader.read()` 抛 `AbortError`，于是**一个健康账号
+    // 会因用户的取消动作被记一次失败**，而 `punishmentForStreamError`
+    // 对非 11128 的错误一律返回 `'breaker'` ⇒ **3 次就把好号熔断 30 分钟**。
+    //
+    // ⇒ 症状正是本项目反复踩到的那个：「账号明明好的，却越来越用不了」。
+    //
+    // ⚠️ 本项目已有这条纪律（`qoder.ts:924`、`zcode.ts:752` 都显式把
+    // 「请求已被客户端取消」原样区分开），且流式路径**已经**用
+    // `hooks.clientGone?.()` 做这个判别（见下方 `[stream] aborted` 那段）。
+    // 非流式路径此前漏了同一条判据 —— 又是「同一个 bug 只修一半」。
+    const clientGone = hooks.clientGone?.() === true
+    if (clientGone) {
+      // ⚠️ **不记失败、不惩罚账号**：这不是账号的问题。
+      // 也不必回响应体（客户端已经走了），但返回一个明确的 499 语义响应，
+      // 便于日志/中间层观察，且**不**触发 hooks.onError。
+      return new Response(
+        JSON.stringify({
+          error: {
+            message: '请求已被客户端取消（连接已断开）。',
+            type: 'client_closed_request',
+            code: 'client_closed_request',
+          },
+        }),
+        { status: 499, headers: { 'content-type': 'application/json; charset=utf-8' } },
+      )
+    }
     // ⚠️ 超时/中止 ⇒ 如实说「上游超时/繁忙」，并标成**可重试**。
     const timedOut = /timeout|timed out|abort/i.test(detail)
     const message = timedOut
@@ -1342,11 +1389,25 @@ async function nonStreamingResponse(
   // 实测踩到：CodeArts 的模型名错误帧既没有 `usage` 也没有正文，
   // 而某次判断只查了 usage —— 结果给客户端一个 `content:''` 的空回答，
   // 用户以为是模型不行，其实是模型名写错了。
+  // ⚠️ 判据**只看有没有内容**，`usage` 不参与判断。
+  //
+  // 我原先写的是 `... && (completion.usage === undefined || completion.usage === null)`——
+  // ⚠️ 那是**错的**：它把「有 usage」当成「不是空响应」的理由，
+  // 于是「消耗了 token 但没产出任何内容」这种**最需要报错**的形态反而被放过
+  //（实测 codearts 就会回 `content:'' + usage:null` 或带 usage 的空帧）。
+  // `usage` 只说「上游计了费」，与「有没有内容」无关。
+  // ⚠️ **必须排除「只调用工具」的正常响应**：那时 `content` 也是 `''`
+  //（`aggregateSse` 把工具调用放进 `choice.message.tool_calls`，
+  // `finish_reason` 为 `'tool_calls'`）。不排除就会把一次**成功**的工具调用
+  // 误报成「上游返回空响应」—— 那是比原缺陷更糟的假阳性
+  //（工具调用是 agent 场景的主路径）。
+  const toolCalls = (choice?.message as { tool_calls?: unknown[] } | undefined)?.tool_calls
+  const hasToolCalls = Array.isArray(toolCalls) && toolCalls.length > 0
   if (
     choice !== undefined
+    && !hasToolCalls
     && choice.message.content === ''
     && (choice.message.reasoning_content ?? '') === ''
-    && (completion.usage === undefined || completion.usage === null)
   ) {
     // ⚠️ **先处理「整个响应体就是一个 JSON（不是 SSE）」的情况**。
     //
@@ -1374,12 +1435,35 @@ async function nonStreamingResponse(
     }
 
     // 流里没有任何内容 —— 找一下是不是错误帧
+    //
+    // ## 🔴 必须复用 `parseSseLine`，不能自己 `startsWith('data: ')`
+    //
+    // 实测缺陷：codearts 经华为 APIG 回的原文是
+    // ```
+    // data:{"error_code":"InferHub.4004.200","error_msg":"benefit not found",...}
+    // ```
+    // ⚠️ 注意 **`data:` 后面没有空格**。
+    //
+    // 而本段原先判的是 `line.startsWith('data: ')`（**带空格**）
+    // ⇒ 这一帧**永远匹配不上** ⇒ 扫不到错误帧 ⇒ 落到下面那条通用兜底，
+    // 用户看到的是「上游返回了空响应…」，而**真实原因是 `benefit not found`**
+    //（账号权益未生效，该采取的行动完全不同）。
+    //
+    // ⚠️ 更值得记的是：**同一个项目里 `parseSseLine`（`stream.ts:47`）
+    // 早就同时容忍两种写法**（`startsWith('data:')` + `.trim()`）——
+    // 我在这里又手写了一遍解析，就漏掉了无空格形态。
+    // **教训：SSE 解析一律走 `parseSseLine`，不要手写前缀判断。**
     for (const line of raw.split('\n')) {
-      if (!line.startsWith('data: ')) continue
-      const payload = line.slice(6).trim()
-      if (payload === '' || payload === '[DONE]') continue
+      const frame = parseSseLine(line)
+      // ⚠️ `parseSseLine` 已经把注释/空行/`[DONE]` 归为 `ignore`/`done`。
+      // `kind === 'error'` 是它自己解析出的错误（`data:` 前缀两种写法都认）。
+      if (frame.kind === 'error' && typeof frame.error === 'string') {
+        hooks.onError(frame.error)
+        return jsonError(502, frame.error, 'upstream_error')
+      }
+      if (frame.kind !== 'chunk' || typeof frame.data !== 'string') continue
       try {
-        const parsed = JSON.parse(payload) as Record<string, unknown>
+        const parsed = JSON.parse(frame.data) as Record<string, unknown>
         const err = detectErrorFrame(parsed)
         if (err !== undefined) {
           hooks.onError(err)
@@ -1389,6 +1473,33 @@ async function nonStreamingResponse(
         // 非 JSON 帧，继续找
       }
     }
+
+    // ## 🔴 找不到错误帧时**也必须报错**，不能落回静默空回复
+    //
+    // 实测缺陷（用户报「codearts 调用不了」，且现象是**空回复而不是报错**）：
+    // CodeArts 在「并发会话数已达上限(3个)」时，旧版路径会给一个
+    // `content:'' + finish_reason:'stop' + usage:null` 的 **HTTP 200 空答案**，
+    // 而它在流式路径**是**会报错的 —— 两条路径口径不一致。
+    //
+    // ⚠️ 上面那段只在**识别到错误帧**时才报错；若上游给的是「合法但完全空」
+    // 的响应（没有错误帧、也没有内容），流程会**落回下面的正常返回**
+    // ⇒ 客户端拿到 `content:''`，看起来像「模型说了空话」。
+    //
+    // ⚠️ 这是本项目 §7.2「失败必须显式」明确禁止的形态：**空回复比报错更糟**，
+    // 用户会以为是模型能力问题，而真实原因是上游拒绝了这次请求。
+    // ⇒ 兜底：走到这里说明「既没内容、也没能定位到错误帧」，那也要如实报错。
+    //
+    // ⚠️ 注意此处**不能**用 `hooks.onError` 记成「账号失败」——我们无法确定
+    // 是账号问题还是上游临时抽风，而误记会让健康账号被冷却
+    //（本项目反复踩到的「状态看着对、行为不对」型缺陷）。只如实回报给客户端。
+    const snippet = raw.trim().slice(0, 200)
+    return jsonError(
+      502,
+      '上游返回了空响应（既没有正文/思考内容，也没有可识别的错误帧）。'
+        + '这通常意味着上游临时拒绝或该模型不可用，请稍后重试。'
+        + (snippet === '' ? '' : `上游原文片段：${snippet}`),
+      'upstream_error',
+    )
   }
 
   hooks.onFirstChunk()
