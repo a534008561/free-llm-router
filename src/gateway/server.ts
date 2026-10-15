@@ -42,6 +42,7 @@ import {
   type ProviderCatalog,
 } from './aggregate.js'
 import { splitModelName, type ProviderCredential } from '../providers/types.js'
+import { settleUsage, type SubkeyContext } from './authz.js'
 import type { LoginCredential } from '../upstream/auth.js'
 import type { AccountPoolDO } from '../pool/AccountPoolDO.js'
 
@@ -359,6 +360,14 @@ export async function handleChatCompletions(
    * 否则响应一结束 Worker 就会取消它。
    */
   ctx?: ExecutionContext,
+  /**
+   * 命中的**子密钥上下文**（`undefined` = 主密钥，不受配额限制）。
+   *
+   * ⚠️ 只传「要不要额外记一笔 token、记给谁」，不把整个 `AuthResult` 递进来：
+   * 网关不该知道主密钥/子密钥的区别细节，它只负责「多记一笔账」。
+   * ⚠️ IP 由上下文带进来（不在这里从 request 读）——见 `SubkeyContext` 的说明。
+   */
+  subkey?: SubkeyContext,
 ): Promise<GatewayResult> {
   // ① 解析并准备请求体（一次性，不随换号重复）
   let rawBody: unknown
@@ -403,7 +412,7 @@ export async function handleChatCompletions(
       // 引用未初始化的 `const` 会抛 TDZ 错误。判据与外层**逐字一致**：
       // OpenAI 规范里 `stream` 缺省是 `false`（非流式）。
       wantsStream: (rawBody as Record<string, unknown>).stream === true,
-      rawBody, request, env, realm, ctx, sessionKey,
+      rawBody, request, env, realm, ctx, sessionKey, subkey,
     })
   }
 
@@ -456,7 +465,7 @@ export async function handleChatCompletions(
   // 非 WorkBuddy 的供应商走独立的 Provider 接口（协议差异极大，
   // 不能把分支塞进下面这段 WorkBuddy 专用逻辑里）。
   if (providerId !== DEFAULT_PROVIDER) {
-    return await handleProviderChat({ providerId, model, wantsStream, rawBody, request, env, realm, ctx, tried: [], sessionKey })
+    return await handleProviderChat({ providerId, model, wantsStream, rawBody, request, env, realm, ctx, tried: [], sessionKey, subkey })
   }
 
   // ⚠️ **必须把请求体里的 model 改写成去前缀的裸名**（实测踩到的真实缺陷，
@@ -657,6 +666,13 @@ export async function handleChatCompletions(
           // ⚠️ 必须 waitUntil：否则响应流结束的瞬间这个 promise 会被取消
           if (ctx !== undefined) ctx.waitUntil(task)
           else void task
+
+          // 子密钥：把真实 token 补录进它的用量（请求数已在放行时占过名额）
+          if (subkey !== undefined) {
+            const t = settleUsage(env, subkey.record, record.input, record.output, model, subkey.ip)
+            if (ctx !== undefined) ctx.waitUntil(t)
+            else void t
+          }
         },
         onError: (message) => {
           // 流**内**错误：无法改 HTTP 状态码了，但要记账
@@ -883,8 +899,10 @@ async function handleProviderChat(input: {
   tried: string[]
   /** 会话粘性 key（由 `handleChatCompletions` 统一派生，空串 = 不做粘性）。 */
   sessionKey: string
+  /** 子密钥上下文（透传下来记账用；主密钥时为 `undefined`）。 */
+  subkey?: SubkeyContext
 }): Promise<GatewayResult> {
-  const { providerId, model, wantsStream, rawBody, request, env, realm, ctx, sessionKey } = input
+  const { providerId, model, wantsStream, rawBody, request, env, realm, ctx, sessionKey, subkey } = input
 
   const provider = findProvider(providerId)
   if (provider === undefined) {
@@ -1220,6 +1238,13 @@ async function handleProviderChat(input: {
           })
           if (ctx !== undefined) ctx.waitUntil(t)
           else void t
+
+          // 子密钥：同 chat 路径，补录真实 token
+          if (subkey !== undefined) {
+            const st = settleUsage(env, subkey.record, record.input, record.output, `${providerId}/${model}`, subkey.ip)
+            if (ctx !== undefined) ctx.waitUntil(st)
+            else void st
+          }
         },
       }, wantsStream ? undefined : { model }),
     }
@@ -1605,8 +1630,10 @@ async function handleAggregateChat(input: {
   realm: string
   ctx?: ExecutionContext
   sessionKey: string
+  /** 子密钥上下文（透传下来记账用；主密钥时为 `undefined`）。 */
+  subkey?: SubkeyContext
 }): Promise<GatewayResult> {
-  const { model, rawBody, request, env, realm, ctx, sessionKey } = input
+  const { model, rawBody, request, env, realm, ctx, sessionKey, subkey } = input
 
   const virtuals = await loadAggregateCatalog(env, realm)
   if (virtuals.length === 0) {
@@ -1718,6 +1745,7 @@ async function handleAggregateChat(input: {
         env,
         realm,
         ...(ctx !== undefined ? { ctx } : {}),
+        ...(subkey !== undefined ? { subkey } : {}),
         tried: [],
         sessionKey,
       })

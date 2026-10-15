@@ -19,16 +19,28 @@ function setMsg(text, ok) {
   el.className = 'login-msg ' + (ok ? 'ok' : 'err')
 }
 
-/** 验证密钥：调一个需要鉴权的轻量端点。 */
+/**
+ * 验证密钥：调一个需要鉴权的轻量端点。
+ *
+ * ⚠️ 返回三态而不是布尔值。
+ *
+ * 原先返回 `res.ok`，于是**网络错误与「密钥无效」被归为同一种结果** ——
+ * 一次 DNS 抖动会让用户看到「密钥无效，请检查后重试」，然后去反复改一个
+ * 本来完全正确的密钥（实测踩到：面板侧同一类缺陷会把已存密钥删掉）。
+ */
 async function verify(key) {
+  let res
   try {
-    const res = await fetch('/admin/pool?realm=cn', {
+    res = await fetch('/admin/pool?realm=cn', {
       headers: { authorization: 'Bearer ' + key },
     })
-    return res.ok
   } catch {
-    return false
+    return 'network'
   }
+  if (res.ok) return 'ok'
+  // ⚠️ 只有 401/403 才是「密钥不对」；5xx 是**服务端**的问题，
+  // 把它们混为一谈会让用户白改密钥。
+  return res.status === 401 || res.status === 403 ? 'bad' : 'error'
 }
 
 $('login-form').onsubmit = async (e) => {
@@ -40,10 +52,20 @@ $('login-form').onsubmit = async (e) => {
   btn.disabled = true
   setMsg('验证中…', true)
 
-  const ok = await verify(key)
+  const verdict = await verify(key)
   btn.disabled = false
 
-  if (!ok) {
+  // ⚠️ 必须**分开**报告：把网络/服务端错误说成「密钥无效」会让用户
+  // 去改一个完全正确的密钥（实测踩到过这一类误报）。
+  if (verdict === 'network') {
+    setMsg('网络错误：连不上服务，请检查网络后重试', false)
+    return
+  }
+  if (verdict === 'error') {
+    setMsg('服务暂时不可用，请稍后重试（密钥未被判错）', false)
+    return
+  }
+  if (verdict === 'bad') {
     setMsg('密钥无效，请检查后重试', false)
     return
   }
@@ -56,7 +78,10 @@ $('login-form').onsubmit = async (e) => {
 const saved = localStorage.getItem('wb_api_key') || ''
 if (saved !== '') {
   $('apikey').value = saved
-  void verify(saved).then((ok) => {
-    if (ok) { setMsg('已保存的密钥有效，正在进入…', true); location.href = '/panel/' }
+  void verify(saved).then((verdict) => {
+    // ⚠️ 只在**确认有效**时才自动进入。
+    // 网络错误/服务端错误时**什么都不做** —— 既不能进面板（无法确认），
+    // 也不能删密钥（那会把一次网络抖动变成「被登出」）。
+    if (verdict === 'ok') { setMsg('已保存的密钥有效，正在进入…', true); location.href = '/panel/' }
   })
 }

@@ -53,6 +53,7 @@ import {
   type AggregatedCompletion,
 } from './stream.js'
 import { handleChatCompletions } from './server.js'
+import type { SubkeyContext } from './authz.js'
 import type { Env } from '../env.js'
 
 // ─────────────────────────── 请求侧 ───────────────────────────
@@ -842,6 +843,8 @@ export async function handleResponses(
   env: Env,
   realm = 'cn',
   ctx?: ExecutionContext,
+  /** 子密钥上下文（透传给 chat 处理器，用于配额记账）。 */
+  subkey?: SubkeyContext,
 ): Promise<{ response: Response }> {
   let body: ResponsesRequest
   try {
@@ -880,7 +883,7 @@ export async function handleResponses(
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(chatBody),
   })
-  const inner = await handleChatCompletions(chatRequest, env, realm, ctx)
+  const inner = await handleChatCompletions(chatRequest, env, realm, ctx, subkey)
 
   // 上游失败：把错误**原样**包成 Responses 的形状（不吞掉原因）。
   if (!inner.response.ok || inner.response.body === null) {

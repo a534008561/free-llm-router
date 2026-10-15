@@ -1243,7 +1243,7 @@ function makeEl(tag) {
  *
  * @param fnSource - 要执行的代码（可访问面板里的函数与变量）
  */
-function runPanelJs(fnSource) {
+function runPanelJs(fnSource, options = {}) {
   const src = panelAsset('/panel/app.js')?.body ?? ''
   const els = new Map()
   const document = {
@@ -1271,7 +1271,11 @@ function runPanelJs(fnSource) {
     removeItem: (k) => store.delete(k),
   }
   const window = { open() {}, addEventListener() {}, matchMedia: () => ({ matches: false, addEventListener() {} }) }
-  const fetchStub = async () => ({ ok: true, status: 200, text: async () => '{}', json: async () => ({}) })
+  // ⚠️ 允许注入 fetch/location：`bootstrap()` 的分支判定（401 与网络错误要
+  // 区分对待）只能靠**真的跑一次**来验证 —— 静态断言抓不到「把所有 !ok 都
+  // 当成密钥失效」这类逻辑错误（那正是本次要修的缺陷）。
+  const fetchStub = options.fetch ?? (async () => ({ ok: true, status: 200, text: async () => '{}', json: async () => ({}) }))
+  const locationStub = options.location ?? { href: 'http://x/panel/', search: '' }
   // ⚠️ 用 `new Function` 包一层：面板 JS 里全是函数声明与 const，
   // 直接 eval 会把它们塞进当前作用域，和测试变量撞名。
   // ⚠️⚠️ **必须把定时器换成空实现**。
@@ -1288,7 +1292,11 @@ function runPanelJs(fnSource) {
     'document', 'localStorage', 'window', 'fetch', 'navigator', 'location', 'alert', 'confirm', 'URL', 'AbortController', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval',
     src + '\n;return { ' + fnSource + ' };',
   )
-  return factory(document, localStorage, window, fetchStub, { userAgent: 'test' }, { href: 'http://x/panel/', search: '' }, () => {}, () => true, URL, AbortController, noTimer, noTimer, noTimer, noTimer)
+  const rt = factory(document, localStorage, window, fetchStub, { userAgent: 'test' }, locationStub, () => {}, () => true, URL, AbortController, noTimer, noTimer, noTimer, noTimer)
+  // 把桩暴露出来，便于断言「有没有跳转、密钥有没有被删」
+  rt.__store = store
+  rt.__location = locationStub
+  return rt
 }
 
 test('🔴 loadUsage 必须能**真的跑起来**（TDZ 这类运行时错误只有执行才抓得到）', async () => {
@@ -1889,4 +1897,149 @@ test('🔴 所有安全头必须齐全（登录页也不例外）', () => {
   const block = src.slice(i, i + 300)
   assert.ok(/\.\.\.securityHeaders\(\)/.test(block),
     '⚠️ 登录页头应基于 securityHeaders() 展开（只覆盖 CSP），否则容易漏头')
+})
+
+test('🔴 button.danger 必须用 --err-solid（白字 on --err 只有 3.24:1，不达标）', () => {
+  // 实测（面板全量对比度扫描）：API Key 页的「删除」按钮报 3.24:1，
+  // 低于 WCAG AA 正文 4.5:1。
+  //
+  // ⚠️ 这与 `--accent` 是**同一类**取舍：同一个颜色值不可能同时满足
+  // 「当文字要够亮」与「当按钮底色要够暗」。项目已为 accent 拆出
+  // `--accent-text`，错误色同样必须拆。
+  const css = panelAsset('/panel/style.css')?.body ?? ''
+  assert.ok(/--err-solid:/.test(css), '应定义 --err-solid 令牌')
+  const i = css.indexOf('button.danger')
+  const rule = css.slice(i, css.indexOf('}', i))
+  assert.ok(/background:\s*var\(--err-solid\)/.test(rule),
+    '⚠️ button.danger 必须用 --err-solid（用 --err 则白字对比度不足）')
+  // ⚠️ `--err` 仍要保留给**文字**用（改错了这里会让所有错误文案变暗）
+  assert.ok(/--err:/.test(css), '--err 必须保留（当文字用）')
+  assert.ok(/\.pill\.err\s*\{\s*color:\s*var\(--err\)/.test(css), '--err 仍应作文字色使用')
+})
+
+test('🔴 /v1/* 必须支持 CORS 预检（浏览器调用方否则完全用不了）', () => {
+  // ## 为什么必须测
+  //
+  // `/v1/*` 的定位是给**外部应用**调的。浏览器里的调用方会先发 OPTIONS 预检，
+  // 没有 CORS 头就被浏览器直接拦掉 —— 而服务端日志里**什么都不会出现**
+  //（请求根本没发出去）。实测确认：此前 OPTIONS 返回 404 且无任何 CORS 头。
+  const src = readFileSync('src/index.ts', 'utf8')
+
+  // ① 必须有 CORS 头构造
+  assert.ok(/function withCors/.test(src), '应有 withCors 助手')
+  const i = src.indexOf('function withCors')
+  const block = src.slice(i, i + 1200)
+  assert.ok(/access-control-allow-origin/.test(block), '应有 allow-origin')
+  // ⚠️ Authorization 必须在允许列表里，否则浏览器不会把密钥发出去
+  assert.ok(/allow-headers'[^)]*authorization/i.test(block) || /authorization/i.test(block),
+    '⚠️ allow-headers 必须含 authorization')
+
+  // ② 预检必须在**鉴权之前**处理：预检请求不带 Authorization（浏览器规定），
+  // 落到鉴权分支就只会拿到 401，真正的请求永远发不出去。
+  const optIdx = src.indexOf("request.method === 'OPTIONS'")
+  assert.ok(optIdx > 0, '应显式处理 OPTIONS')
+  const authIdx = src.indexOf('if (!(await authorized(request, env)))')
+  assert.ok(authIdx > 0 && optIdx < authIdx, '⚠️ OPTIONS 处理必须在鉴权之前')
+
+  // ③ 必须在**唯一出口**统一加，而不是各分支各加 ——
+  // 后者必然漏掉流式/错误响应（表现为「有时能调、有时 CORS 报错」）。
+  const i2 = src.indexOf('async function handle(request: Request')
+  const handleBlock = src.slice(i2, i2 + 2000)
+  assert.ok(/withCors\(response\)/.test(handleBlock),
+    '⚠️ 出口处应统一加 CORS（不能逐分支加，会漏）')
+  assert.ok(/withCors\(failure\)/.test(handleBlock),
+    '⚠️ 异常分支也要加（否则 500 会被浏览器报成 CORS 错误，遮住真因）')
+})
+
+test('⚠️ CORS 不得加到 /admin/* 或面板（钓鱼面）', () => {
+  // ⚠️ 只给 `/v1/*` 加：管理端点靠同一个 Authorization 头，
+  // 把它们暴露给任意源会放大钓鱼面（任何网页都能拿粘贴进去的密钥操作账号）。
+  const src = readFileSync('src/index.ts', 'utf8')
+  // ⚠️ 判定收口在 `isV1Request` 里（而不是散落在各处）——
+  // 这样「CORS 只给 v1」这条纪律只有一个地方能违背。
+  assert.ok(/function isV1Request/.test(src), '应有 isV1Request 判定助手')
+  const i = src.indexOf('function isV1Request')
+  const block = src.slice(i, i + 400)
+  assert.ok(/startsWith\('\/v1\/'\)/.test(block),
+    '⚠️ CORS 的适用判定必须限定 /v1/ 前缀')
+  assert.ok(!/admin/.test(block), 'CORS 判定里不得出现 /admin')
+  // `withCors` 自身不得硬编码路径判定（必须走 isV1Request）
+  const j = src.indexOf('function withCors')
+  const corsBlock = src.slice(j, j + 900)
+  assert.ok(!/startsWith\('\/admin/.test(corsBlock), 'withCors 里不得出现 /admin')
+})
+
+// ─────────────── 网络抖动不得被当成「密钥失效」 ───────────────
+//
+// 用户报「面板偶尔会自己掉登录」。根因：`bootstrap()` 里写的是
+// `if (!res.ok) { 删密钥 → 跳登录页 }`，而 `api()` 在网络错误时返回
+// `status: 0`（如 DNS 抖动 `Could not resolve host`）—— 于是**一次瞬时的
+// 网络错误会删掉用户已存的密钥并把他踢回登录页**。
+//
+// 这类缺陷只能靠**真的执行 bootstrap()** 抓：静态看
+// `if (!res.ok)` 完全合理，只有把「网络错误」这个具体返回值喂进去，
+// 才会暴露「删密钥」这个不该发生的副作用。
+
+test('🔴 bootstrap：网络错误**不得**删除密钥或跳登录页（只有 401 才该）', async () => {
+  let removed = false
+  const location = { href: 'http://x/panel/' }
+  // 模拟 `api()` 在网络错误时的返回形状（fetch 抛错 → status 0）
+  const failingFetch = async () => { throw new Error('Could not resolve host') }
+  const rt = runPanelJs('bootstrap', { fetch: failingFetch, location })
+  // 包一层以观察 removeItem 是否被调用
+  const origRemove = rt.__store.delete.bind(rt.__store)
+  let removeCalled = false
+  rt.__store.delete = (k) => { removeCalled = true; return origRemove(k) }
+
+  await rt.bootstrap()
+
+  assert.equal(removeCalled, false,
+    '⚠️ 网络错误时**绝不能**删除密钥（那会让一次 DNS 抖动变成「被登出」）')
+  assert.equal(location.href, 'http://x/panel/',
+    '⚠️ 网络错误时不得跳转到登录页')
+})
+
+test('🔴 bootstrap：401 仍然要删密钥并跳登录页（原行为不能被改坏）', async () => {
+  let removeCalled = false
+  const location = { href: 'http://x/panel/' }
+  const unauthorizedFetch = async () => ({
+    ok: false, status: 401, text: async () => '{"error":{"message":"bad key"}}',
+  })
+  const rt = runPanelJs('bootstrap', { fetch: unauthorizedFetch, location })
+  const origRemove = rt.__store.delete.bind(rt.__store)
+  rt.__store.delete = (k) => { removeCalled = true; return origRemove(k) }
+
+  await rt.bootstrap()
+
+  assert.equal(removeCalled, true, '401 时应删除无效密钥')
+  assert.equal(location.href, '/login', '401 时应跳回登录页')
+})
+
+test('🔴 bootstrap：5xx 不得删除密钥（服务端故障不是密钥的错）', async () => {
+  let removeCalled = false
+  const location = { href: 'http://x/panel/' }
+  const serverErrorFetch = async () => ({
+    ok: false, status: 500, text: async () => '{"error":{"message":"boom"}}',
+  })
+  const rt = runPanelJs('bootstrap', { fetch: serverErrorFetch, location })
+  const origRemove = rt.__store.delete.bind(rt.__store)
+  rt.__store.delete = (k) => { removeCalled = true; return origRemove(k) }
+
+  await rt.bootstrap()
+
+  assert.equal(removeCalled, false, '⚠️ 5xx 时不得删除密钥')
+  assert.equal(location.href, 'http://x/panel/', '⚠️ 5xx 时不得跳登录页')
+})
+
+test('⚠️ 登录页：网络错误不得报成「密钥无效」（否则用户会白改密钥）', () => {
+  const js = panelAsset('/panel/login.js')?.body ?? ''
+  // 三态判定：ok / bad / network（原先只有布尔，必然混淆）
+  assert.ok(/return 'network'/.test(js), '网络错误应单独归类')
+  assert.ok(/verdict === 'network'/.test(js), '应分开提示网络错误')
+  assert.ok(/网络错误/.test(js), '应有「网络错误」文案')
+  // ⚠️ 不得再出现「把非 ok 一律说成密钥无效」的写法
+  assert.ok(!/if \(!ok\) \{\s*setMsg\('密钥无效/.test(js),
+    '⚠️ 不得把非 ok 一律判为密钥无效')
+  // 自动登录只在**确认有效**时发生（网络抖动时不能删密钥/乱跳）
+  assert.ok(/if \(verdict === 'ok'\)/.test(js), '⚠️ 自动进入必须只在确认有效时')
 })

@@ -70,6 +70,24 @@ import type { LoginCredential } from './upstream/auth.js'
 import { parseAuthDocument, parseAuthPayload } from './upstream/import.js'
 import { handleResponses } from './gateway/responses.js'
 import { handleChatCompletions } from './gateway/server.js'
+import {
+  type AuthResult,
+  type SubkeyContext,
+  authenticate,
+  clientIpOf,
+  countUse,
+} from './gateway/authz.js'
+import { modelAllowed } from './store/apikeys.js'
+import {
+  emptyApiKeyUsage,
+  generateApiKey,
+  hashApiKey,
+  isWindowExpired,
+  keyPrefix,
+  normalizeApiKeyLimits,
+  resetUsageWindow,
+  toApiKeyView,
+} from './store/apikeys.js'
 import { fetchBalance } from './upstream/checkin.js'
 import { listTasks } from './upstream/tasks.js'
 import { listModels, pickCredential } from './gateway/models.js'
@@ -171,6 +189,54 @@ import { panelAsset, securityHeaders, loginSecurityHeaders } from './panel/index
 
 // DO 类必须从入口导出，否则 wrangler 找不到绑定目标。
 export { AccountPoolDO, TaskRunnerDO }
+
+/**
+ * CORS 响应头（**仅 `/v1/*`**）。
+ *
+ * ## 为什么需要
+ *
+ * `/v1/*` 的定位是「给外部应用调用的 OpenAI 兼容接口」。
+ * 而**浏览器里**的调用方（网页应用、本地前端、VS Code 类扩展的 webview）
+ * 会先发一个 `OPTIONS` 预检 —— 没有 CORS 头就会被浏览器直接拦掉，
+ * 而服务端日志里**什么都不会出现**（因为请求根本没发出去）。
+ * 实测确认：之前 `OPTIONS /v1/chat/completions` 返回 404 且无任何 CORS 头。
+ *
+ * ## 为什么用 `*` 是安全的（这里不涉及 cookie）
+ *
+ * CORS 的“危险”来自「浏览器自动附带凭据」——而本服务的鉴权**只认
+ * `Authorization` 头**，浏览器不会自动带上它（见面板设计里“刻意不用 cookie”的说明）。
+ * 故 `*` 只是说“任何源都可以**尝试**调用”，而“能不能调”仍由密钥决定。
+ * 这也与 `/v1/*` 本是公开 API 的定位一致。
+ *
+ * ⚠️ 绝不要给 `/admin/*` 或面板加这组头：那些端点靠的是同一个
+ * `Authorization` 头，但把它们暴露给任意源，等于让任何网页都能
+ * 拿着用户粘贴进去的密钥去操作账号（钓鱼面变大）。故这里**只**用于 `/v1/*`。
+ */
+/**
+ * 判断是不是 `/v1/*` 请求（CORS 只给这一族加）。
+ *
+ * ⚠️ URL 解析可能抛（异常输入），此时**返回 false**（当作非 v1）：
+ * 那意味着不加 CORS —— 保守方向。反过来（误判成 v1）会给管理端点加上 CORS。
+ */
+function isV1Request(request: Request): boolean {
+  try {
+    return new URL(request.url).pathname.startsWith('/v1/')
+  } catch {
+    return false
+  }
+}
+
+function withCors(response: Response): Response {
+  const headers = new Headers(response.headers)
+  headers.set('access-control-allow-origin', '*')
+  // ⚠️ `Authorization` 必须在允许列表里：否则浏览器不会把密钥发出去。
+  headers.set('access-control-allow-headers', 'authorization, content-type')
+  headers.set('access-control-allow-methods', 'GET, POST, OPTIONS')
+  // ⚠️ 预检结果缓存 24 小时：否则**每个**请求都多一次 OPTIONS 往返，
+  // 对流式对话这种高频场景是纯粹的延迟浪费。
+  headers.set('access-control-max-age', '86400')
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
+}
 
 /** JSON 响应助手，统一 no-store（避免缓存鉴权结果）。 */
 function json(value: unknown, status = 200): Response {
@@ -1030,7 +1096,8 @@ async function pollTraeLogin(
  */
 async function handle(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   try {
-    return await handleInner(request, env, ctx)
+    const response = await handleInner(request, env, ctx)
+    return isV1Request(request) ? withCors(response) : response
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     const stack = error instanceof Error ? (error.stack ?? '') : ''
@@ -1041,7 +1108,7 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
       `[unhandled] ${request.method} ${url?.pathname ?? '(bad url)'} → ${message}\n${stack}`,
     )
     // 回给客户端**可读原因**（而不是 `error code: 1101`）。
-    return new Response(
+    const failure = new Response(
       JSON.stringify({
         error: {
           message: `服务内部错误：${message}`,
@@ -1051,13 +1118,121 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
       }),
       { status: 500, headers: { 'content-type': 'application/json; charset=utf-8' } },
     )
+    // ⚠️ 异常分支同样要加 CORS：否则 `/v1/*` 出错时浏览器只会报
+    // 「CORS 错误」，把真正的 500 原因**完全遮住**（排查会走大弯路）。
+    return isV1Request(request) ? withCors(failure) : failure
   }
+}
+
+/**
+ * 从请求体里读 `model`（不消费 body）。
+ *
+ * ⚠️ 用 `request.clone()`：直接 `request.json()` 会把 body 读掉，
+ * 后面 `handleChatCompletions` 再读就报 `Body is unusable`。
+ * Clone 是标准做法（两路各持一份流）。
+ *
+ * 读不到 model 时返回空串（由调用方决定怎么处理 —— 不要在这里报错，
+ * 因为「model 缺失」的真实报错应该由网关层给出更准确的文案）。
+ */
+async function peekModel(request: Request): Promise<string> {
+  try {
+    const body = (await request.clone().json()) as unknown
+    if (body === null || typeof body !== 'object') return ''
+    const m = (body as Record<string, unknown>).model
+    return typeof m === 'string' ? m : ''
+  } catch {
+    return ''
+  }
+}
+
+/** 子密钥守卫的结果。 */
+interface V1Guard {
+  /** 非 `undefined` 时应直接返回它（鉴权失败）。 */
+  denied?: Response
+  /** 命中的子密钥上下文（主密钥时为 `undefined`）。 */
+  key?: SubkeyContext
+}
+
+/**
+ * `/v1/*` 的鉴权与配额守卫。
+ *
+ * ## 为什么必须在这一层做（而不是在 `handleInner` 的鉴权段）
+ *
+ * 模型白名单需要请求体里的 `model` 字段，而请求体只能读一次 ——
+ * 在鉴权段读了，后面的网关就拿到了一个已消费的 body。
+ * 故把「需要模型才能判的鉴权」推到网关入口，用 `request.clone()` 预读。
+ *
+ * ## 记账时机（关键）
+ *
+ * **放行时立即占请求数名额**，不等响应结束 —— 否则流式响应会到最后一刻
+ * 才计数，并发请求会全部穿过配额检查（配额形同虚设）。
+ * token 则在流结束后由 `settleUsage` 补录（那时才知道）。
+ */
+async function guardV1(
+  request: Request,
+  env: Env,
+  cached: AuthResult | undefined,
+): Promise<V1Guard> {
+  const model = await peekModel(request)
+  const auth = cached ?? (await authenticate(request, env, model))
+
+  if (auth.kind === 'none') {
+    return {
+      denied: json({ error: { message: 'Missing or invalid API key', type: 'authentication_error' } }, 401),
+    }
+  }
+  if (auth.kind === 'admin') return {}
+  if (auth.kind === 'subkey-denied') {
+    // ⚠️ 被拒也要记一笔（`rejected`）—— 用户排查「为何调用不了」时
+    // 在面板上能看到「有 N 次被拒」，而不是只看到「没用过」。
+    // 但**不**计入 requests（配额不该因为被拒而消耗）。
+    try {
+      await env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn')).recordApiKeyUse({
+        id: auth.record.id,
+        ip: clientIpOf(request),
+        model,
+        input: 0,
+        output: 0,
+        rejected: true,
+      })
+    } catch {
+      // 记账失败不影响拒绝结果
+    }
+    return {
+      denied: json({ error: { message: auth.reason, type: 'permission_error' } }, auth.status),
+    }
+  }
+
+  // 命中可用子密钥：
+  // ⚠️ 模型白名单已在 `authenticate` 里查过（它拿着同一份 `model`），
+  // 这里是第二道防线：防止有人后续改动走到这条路径时绕过。
+  if (model !== '' && !modelAllowed(model, auth.record.limits.models)) {
+    return {
+      denied: json({ error: { message: `模型 ${model} 不在允许列表内`, type: 'permission_error' } }, 403),
+    }
+  }
+
+  // 占名额（不 await —— 不拖慢首字节；失败会打日志，不静默）
+  void countUse(env, auth.record, request, model)
+  // ⚠️ IP 在**这里**读（拿的是原始 request），随上下文传下去 ——
+  // `/v1/responses` 会新造 Request，届时 CF-Connecting-IP 已经不在头里了。
+  return { key: { record: auth.record, ip: clientIpOf(request) } }
 }
 
 /** 真正的业务路由（异常由上面的 {@link handle} 统一兜住）。 */
 async function handleInner(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url)
   const path = url.pathname
+
+  /**
+   * `/v1/*` 本次请求的鉴权结果（`undefined` = 尚未判定）。
+   *
+   * ⚠️ 之所以用变量在函数作用域里传递，而不是每个分支各自调一次
+   * `authenticate`：鉴权要读 DO（两三次往返），一个请求只能鉴一次；
+   * 且 `/v1/chat/completions` 的 prompt 里就带着模型名，
+   * 「先暂存结果、到分支里再用」能让模型白名单在同一处生效。
+   */
+  let v1Auth: AuthResult | undefined
 
   // ── 免鉴权：存活探针（不含任何敏感信息） ──
   if (path === '/healthz') {
@@ -1119,8 +1294,62 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     return await handleTraeCallback(env, url, path)
   }
 
-  // ── 其余一律鉴权 ──
-  if (!(await authorized(request, env))) {
+  // ── 鉴权 ──
+  //
+  // ## 两套凭据
+  //
+  // 1. **主密钥**（Worker secret `API_KEY`）—— 全量权限：面板、`/admin/*`、`/v1/*`；
+  // 2. **子密钥**（自定义 API Key）—— **只能**调 `/v1/*`，且受配额/IP/模型限制。
+  //
+  // ⚠️ 子密钥走的是「先放行、后记账」：模型白名单要从**请求体**里读，
+  // 而请求体只能读一次，故对话路径的鉴权推到 `guardV1()` 里做
+  //（它用 `request.clone()` 预读 model，不消费原 body）。这里只处理：
+  //   - `/admin/*` 与面板：**只认主密钥**（子密钥不得触管理面）；
+  //   - `/v1/models`：无请求体，在这里就能判完；
+  //   - 其余 `/v1/*`：交给各分支自己的 `guardV1()`。
+  const isV1 = path.startsWith('/v1/')
+
+  // ⚠️ CORS 预检：浏览器调用方会先发 `OPTIONS`。必须在**鉴权之前**处理 ——
+  // 预检请求**不带** `Authorization`（那是浏览器的规定），
+  // 它落到鉴权分支就只会拿到 401，于是真正的请求永远不会发出。
+  if (isV1 && request.method === 'OPTIONS') {
+    return withCors(new Response(null, { status: 204 }))
+  }
+
+  if (isV1) {
+    // `/v1/models` 没有请求体（拿不到模型名）⇒ 在这里就能判完。
+    // `/v1/chat/completions` 与 `/v1/responses` 需要请求体里的 model，
+    // 放到下面的分支里用 `guardV1` 判。
+    if (path === '/v1/models') {
+      const auth = await authenticate(request, env, '')
+      if (auth.kind === 'none') {
+        return json({ error: { message: 'Missing or invalid API key', type: 'authentication_error' } }, 401)
+      }
+      if (auth.kind === 'subkey-denied') {
+        // ⚠️ 被拒也要记一笔（`rejected`）—— 否则面板上「用量全 0、却调不通」
+        // 看不出发生了什么。与 `guardV1` 的处理保持一致。
+        try {
+          await env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn')).recordApiKeyUse({
+            id: auth.record.id, ip: clientIpOf(request), model: '',
+            input: 0, output: 0, rejected: true,
+          })
+        } catch { /* 记账失败不影响拒绝结果 */ }
+        return json({ error: { message: auth.reason, type: 'permission_error' } }, auth.status)
+      }
+      v1Auth = auth
+      // ⚠️ **子密钥必须在这里占名额**。
+      //
+      // 实测缺陷：一开始只在 `guardV1`（对话路径）里计数，于是
+      // `/v1/models` 可以**无限次**调用而不消耗任何配额 —— 面板上
+      // 「请求数」永远是 0，用户会以为配额统计坏了。
+      //
+      // 为什么不把「列模型」当免费操作：既然它走同一个网关、同一个鉴权、
+      // 消耗同一份上游连接预算，把它排除在外只会让「用量」这个数字
+      // 与实际发生的调用对不上 —— 而一个对不上的配额表比没有配额表更糟。
+      if (auth.kind === 'subkey') void countUse(env, auth.record, request, '')
+    }
+    // 其余 `/v1/*` 不在鉴权（`v1Auth` 仍是 `undefined`）——见各分支。
+  } else if (!(await authorized(request, env))) {
     return json({ error: { message: 'Missing or invalid API key', type: 'authentication_error' } }, 401)
   }
 
@@ -2427,6 +2656,115 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     return json({ ok: true, order, disabled })
   }
 
+  // ═══════════════════ 自定义 API Key（子密钥） ═══════════════════
+  //
+  // ## 为什么子密钥必须只有主密钥能管
+  //
+  // 这几个端点全部在下面的「先过 admin 鉴权」段落之后，故天然只认主密钥 ——
+  // 子密钥连**列列表**都不行。否则一把泄漏的子密钥可以自己给自己扩容。
+  //
+  // ## 明文只在两个地方出现
+  //
+  // ① 创建响应；② 重置响应。之后**永不回显**（库里只有哈希）。
+  // 这是刻意的：若列表能回显明文，那么任何一次面板 XSS / 屏幕截图
+  // 就等于密钥泄漏 —— 而用户本来只需保存一次。
+
+  if (path === '/admin/apikeys' && request.method === 'GET') {
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const records = await pool.listApiKeys()
+    const usages = await pool.listApiKeyUsages()
+    const now = Date.now()
+    const keys = records.map((r) => {
+      let u = usages[r.id] ?? emptyApiKeyUsage()
+      // ⚠️ 面板展示要反映**当前窗口**：窗口已过期就展示归零后的值，
+      // 否则用户会看到「上一窗口用满了」而实际新窗口是空的（误判成超额）。
+      if (isWindowExpired(u, r.limits, now)) u = resetUsageWindow(u, now)
+      return toApiKeyView(r, u)
+    })
+    // 最近创建的在前（新加的更容易找到）
+    keys.sort((a, b) => b.createdAt - a.createdAt)
+    return json({ keys, now })
+  }
+
+  if (path === '/admin/apikeys' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+    const name = typeof body.name === 'string' && body.name.trim() !== '' ? body.name.trim().slice(0, 60) : '未命名'
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    // ⚠️ 生成→哈希→存库；明文只在本次响应里返回。
+    const plaintext = generateApiKey()
+    const record = await pool.addApiKey({
+      name,
+      hash: await hashApiKey(plaintext),
+      prefix: keyPrefix(plaintext),
+    })
+    // 创建时就可以带上限制（面板的「新建」表单支持一次填完）
+    const limits = normalizeApiKeyLimits(body.limits)
+    const saved = await pool.updateApiKey(record.id, { limits })
+    if (saved === undefined) return jsonError(500, '创建后回读失败', 'internal_error')
+    return json({
+      // ⚠️ **只在这里出现一次**（面板必须提示用户立即复制）
+      key: plaintext,
+      record: toApiKeyView(saved, emptyApiKeyUsage()),
+    })
+  }
+
+  if (path === '/admin/apikeys/update' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+    const id = typeof body.id === 'string' ? body.id : ''
+    if (id === '') return jsonError(400, 'id 必填', 'invalid_request_error')
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const patch: { name?: string; enabled?: boolean; limits?: ReturnType<typeof normalizeApiKeyLimits> } = {}
+    if (typeof body.name === 'string' && body.name.trim() !== '') patch.name = body.name.trim().slice(0, 60)
+    if (typeof body.enabled === 'boolean') patch.enabled = body.enabled
+    if (body.limits !== undefined) patch.limits = normalizeApiKeyLimits(body.limits)
+    const updated = await pool.updateApiKey(id, patch)
+    if (updated === undefined) return jsonError(404, `找不到 id 为「${id}」的 API Key`, 'not_found')
+    const usage = await pool.getApiKeyUsage(id)
+    return json({ ok: true, record: toApiKeyView(updated, usage) })
+  }
+
+  // ⚠️ 重命名端点路径带 `reset` + POST：语义上「生成新的密钥材料」
+  // 是**不可逆**的操作（旧 Key 立刻失效），不能是 GET。
+  if (path === '/admin/apikeys/reset' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as { id?: unknown }
+    const id = typeof body.id === 'string' ? body.id : ''
+    if (id === '') return jsonError(400, 'id 必填', 'invalid_request_error')
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const plaintext = generateApiKey()
+    const updated = await pool.updateApiKey(id, {
+      hash: await hashApiKey(plaintext),
+      prefix: keyPrefix(plaintext),
+    })
+    if (updated === undefined) return jsonError(404, `找不到 id 为「${id}」的 API Key`, 'not_found')
+    // ⚠️ 重置后同时**清空用量**：新密钥不该继承旧密钥的配额消耗
+    //（否则用户「重置一下」发现还是超限，会以为重置没生效）。
+    await pool.resetApiKeyUsage(id)
+    const usage = await pool.getApiKeyUsage(id)
+    return json({ key: plaintext, record: toApiKeyView(updated, usage) })
+  }
+
+  if (path === '/admin/apikeys/remove' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as { id?: unknown }
+    const id = typeof body.id === 'string' ? body.id : ''
+    if (id === '') return jsonError(400, 'id 必填', 'invalid_request_error')
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const removed = await pool.removeApiKey(id)
+    // ⚠️ 删除不存在的条目返回 404（而不是静默 ok）——
+    // 静默成功会让用户以为删掉了，刷新后它又回来了。
+    if (!removed) return jsonError(404, `找不到 id 为「${id}」的 API Key`, 'not_found')
+    return json({ ok: true })
+  }
+
+  if (path === '/admin/apikeys/reset-usage' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as { id?: unknown }
+    const id = typeof body.id === 'string' ? body.id : ''
+    if (id === '') return jsonError(400, 'id 必填', 'invalid_request_error')
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const okReset = await pool.resetApiKeyUsage(id)
+    if (!okReset) return jsonError(404, `找不到 id 为「${id}」的 API Key`, 'not_found')
+    return json({ ok: true })
+  }
+
   // ── 按供应商列模特（面板用） ──
   if (path === '/admin/providers/models' && request.method === 'GET') {
     const providerId = url.searchParams.get('provider') ?? DEFAULT_PROVIDER
@@ -3085,9 +3423,16 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         'no_available_account',
       )
     }
+    // ⚠️ 子密钥要**过滤模型目录**：只留它被允许的。
+    // 不过滤的话用户能看到 100 个模型、挑一个、然后被 403 ——
+    // 「看得见但用不了」比「看不见」更让人困惑。
+    // 主密钥（`v1Auth.kind === 'admin'`）不过滤。
+    const visible = v1Auth?.kind === 'subkey'
+      ? data.filter((m) => modelAllowed(String(m.id), v1Auth.record.limits.models))
+      : data
     return json({
       object: 'list',
-      data,
+      data: visible,
       ...(errors.length === 0 ? {} : { errors }),
       disabledCount: disabledTotal,
     })
@@ -3096,7 +3441,11 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   // ── OpenAI 兼容：对话（**流式 SSE 透传**） ──
   if (path === '/v1/chat/completions' && request.method === 'POST') {
     const realm = url.searchParams.get('realm') ?? 'cn'
-    const result = await handleChatCompletions(request, env, realm, ctx)
+    // ⚠️ 子密钥必须在**这里**鉴权：模型白名单要从请求体读 model，
+    // 而请求体只能读一次（读两遍会报 Body already used）。
+    const guard = await guardV1(request, env, v1Auth)
+    if (guard.denied !== undefined) return guard.denied
+    const result = await handleChatCompletions(request, env, realm, ctx, guard.key)
     // ⚠️ 流式响应必须**原样返回** —— 不要在这里包装或缓冲，
     // 那会破坏逐字输出并可能超出 CPU 预算。
     return result.response
@@ -3111,7 +3460,10 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   // 依据：参考实现 `openai-gateway/responses.ts:12-16`。
   if (path === '/v1/responses' && request.method === 'POST') {
     const realm = url.searchParams.get('realm') ?? 'cn'
-    const result = await handleResponses(request, env, realm, ctx)
+    // 同 Chat 路径：子密钥鉴权与模型白名单都在 `guardV1` 里收口。
+    const guard = await guardV1(request, env, v1Auth)
+    if (guard.denied !== undefined) return guard.denied
+    const result = await handleResponses(request, env, realm, ctx, guard.key)
     // 同 Chat 路径：流式响应**原样返回**，不在这里包装或缓冲。
     return result.response
   }
