@@ -127,9 +127,26 @@ function buildTable(cols, rows, numericFrom) {
       // ⚠️ 单元格可以是 `[显示文本, 悬浮全文]` 两元组。
       // 用途：表格里不得不截断的长文案（如失败原因），截断后仍能通过
       // `title` 悬浮看到全文 —— 否则用户只看到半句话，无从判断该怎么办。
-      const text = Array.isArray(cell) ? cell[0] : cell
-      td.textContent = String(text)
-      if (Array.isArray(cell) && cell[1]) td.title = String(cell[1])
+      // ⚠️ 三种单元格形态（按优先级）：
+      //   1. `{ node }` —— **富单元格**：直接插一个 DOM 节点（用于徽章等）；
+      //   2. `[显示文本, 悬浮全文]` 两元组 —— 截断但保留全文；
+      //   3. 普通值 —— 当文本。
+      // ⚠️ `null` / `undefined` ⇒ **空单元格**（不渲染 "null" 字样）。
+      // 用途：「该字段不存在」时留白，比播报「未标注」干净得多
+      //（一列里 39/46 都是同一个词，看着像坏了）。
+      const empty = cell === null || cell === undefined
+      const rich = !empty && typeof cell === 'object'
+        && !Array.isArray(cell) && 'node' in cell
+      if (empty) {
+        // 什么都不写 ⇒ 空单元格（见上方说明）
+      } else if (rich) {
+        td.appendChild(cell.node)
+        if (cell.title !== undefined) td.title = String(cell.title)
+      } else {
+        const text = Array.isArray(cell) ? cell[0] : cell
+        td.textContent = String(text)
+        if (Array.isArray(cell) && cell[1]) td.title = String(cell[1])
+      }
       if (numericFrom !== undefined && i >= numericFrom) td.className = 'num'
       tr.appendChild(td)
     })
@@ -168,7 +185,9 @@ const VIEW_LOADERS = {
   tasks: () => loadAccounts(),
   usage: () => loadUsage(),
   apikeys: () => loadApiKeys(),
-  models: () => { /* 手动触发 */ },
+  // ⚠️ 已改为**自动加载**（用户要求）：进视图就拉目录，不必再点按钮。
+  // 按钮随之改名为「刷新目录」—— 它的语义现在是「重新拉一次」而非「首次加载」。
+  models: () => loadModels(),
   config: () => loadConfig(),
   logs: () => loadLogs(),
 }
@@ -1104,7 +1123,17 @@ async function loadUsage() {
   const outputTokens = sum('outputTokens')
   const avgMs = total === 0 ? 0 : Math.round(parts.reduce((n, p) => n + p.avgMs * p.total, 0) / total)
   const windowDays = parts[0].windowDays
-  const activeDays = sum('activeDays')
+  // ## 🔴 **不能把两个 realm 的 `activeDays` 相加**（用户报「7 天却显示 8 天有记录」）
+  //
+  // 每个 realm 各返回自己窗口内的活跃天数，而两个 realm 的天数会**重叠**
+  //（同一天 cn 与 global 都可能有用量）。相加会把重叠的天算两遍 ——
+  // 实测 7 天窗口：cn=7 + global=3 = **10**，而窗口本身只有 7 天。
+  // 极端情况 1 天窗口：两边当天都有 ⇒ 1+1 = **2 天**（用户看到的就是这个）。
+  //
+  // ⇒ 正确做法是**按日键去重**。而 `byDayMap` 恰好已经按 `b.day` 合并过了，
+  // 故活跃天数就是它的 size —— 这也与「按天趋势」柱数天然一致
+  //（两处用同一个事实，不会出现「N 天有记录」与柱子数对不上）。
+  const activeDays = byDayMap.size
 
   // ── KPI 卡片（照 cpa-usage-keeper 的观感：大数字 + 彩色图标章 + 带单位副标题）──
   //
@@ -1242,6 +1271,47 @@ function renderUsageRanking(box, rows, key, labelOf) {
 
 
 
+/**
+ * 计费倍率徽章（照参考 fork 的观感：彩色药丸 + 人话）。
+ *
+ * ⚠️ 三态语义**必须区分**（`priceFactor` 的约定）：
+ *   · `0`        ⇒ **免费**
+ *   · 有限值      ⇒ `x N` 倍率
+ *   · `Infinity` ⇒ **不可用 / 未标倍率**（**不是免费**）
+ * 把 Infinity 显示成「免费」会误导用户去调一个其实要计费的模型。
+ */
+function priceBadge(factor) {
+  const span = document.createElement('span')
+  const free = factor === 0
+  const unknown = !Number.isFinite(factor) && factor !== 0
+  if (unknown) {
+    // ⚠️⚠️ **不能说「不可用」** —— 实测这些模型**能正常调通**，
+    // 它们只是该家没下发倍率字段（如 opencode 这类）。
+    //
+    // ⚠️ 更不该**满屏都写「未标注」** —— 那看着像坏了。
+    // 一列里绝大多数都是同一个「未知」时，**留空**比重复 39 次更有信息量：
+    // 空白一眼就知道「这列对我这批模型没意义」。
+    // ⚠️ 返回 `null` 而不是空标签：空标签仍会占一格宽度，
+    // 整列看着就是一片小方框。`null` 让表格**什么都不渲染**。
+    return null
+  } else if (free) {
+    span.className = 'tag ok'
+    span.textContent = '免费'
+    span.title = '免费额度模型'
+  } else {
+    span.className = 'tag warn'
+    span.textContent = 'x' + factor.toLocaleString('zh-CN')
+    span.title = '计费倍率 ' + factor
+  }
+  return { node: span, title: span.title }
+}
+
+/**
+ * 模型目录页。
+ *
+ * ⚠️ **自动加载**（用户要求）：进视图就拉，不必再点按钮。
+ * 按钮语义随之改成「刷新目录」—— 它现在是「重新拉一次」而不是「首次加载」。
+ */
 async function loadModels() {
   const box = $('models')
   clear(box)
@@ -1250,13 +1320,64 @@ async function loadModels() {
 
   const res = await api('/v1/models')
   clear(box)
-  if (!res.ok) { const e = document.createElement('p'); e.className = 'hint'; e.textContent = '加载失败'; box.appendChild(e); return }
+  if (!res.ok) {
+    const e = document.createElement('p'); e.className = 'hint'
+    e.textContent = '加载失败（密钥或网络问题）'
+    box.appendChild(e)
+    return
+  }
   const data = (res.body && res.body.data) || []
-  // ⚠️ 名称缺失时**回落到 id** —— 后端已给名称，但前端不该因为少一个字段
-  // 就渲染出**空单元格**（实测反馈：整列空白看起来像渲染失败）。
-  box.appendChild(wrapTable(buildTable(['id', '名称'], data.map((m) => [m.id, m.name || m.id]))))
+  if (data.length === 0) {
+    const e = document.createElement('p'); e.className = 'hint'
+    e.textContent = '没有可用模型（可能所有账号都在冷却，或全部模型被停用）'
+    box.appendChild(e)
+    return
+  }
+
+  // ⚠️ 列顺序照参考 fork：**模型 id 在最左**（用户最先看它），
+  // 然后名称 / 所属提供商 / 倍率 / 状态。
+  // ⚠️ 名称缺失时**回落到 id** —— 少一个字段不该渲染出空单元格
+  //（实测反馈：整列空白看起来像渲染失败）。
+  const rows = data.map((m) => {
+    // realm 是 `'*'` 表示聚合（跨分片汇总）
+    return [
+      m.id,
+      m.name || m.id,
+      m.providerName || (m.owned_by === 'aggregate' ? '聚合（跨渠道）' : '—'),
+      // ⚠️ **`isFree` 优先于 `priceFactor`**（用户要求「免费用绿色显示免费」）。
+      //
+      // ## 🔴 这是我上一版「好多不显示」的真正原因
+      //
+      // `cline` 有 **21 个 `cline-free/*` 模型**，其 `isFree` 已被 provider
+      // 正确算出（`recommended-models` 是免费集合的权威来源），但这家
+      // **不下发 `credits`** ⇒ `priceFactor` 是 undefined ⇒ 倍率列**一片空白**。
+      // 而「免费」这个事实**本来就有**，只是被塞在另一列的文字里。
+      //
+      // ⚠️ 故这里让 `isFree` **压过** `priceFactor`：免费就是免费，
+      // 不管上游有没有给倍率。
+      // ⚠️ **聚合条目不给倍率**（用户要求）—— 它的倍率是「各候选里最便宜的那个」，
+      // 那是个**推导值**而非上游事实；显示它会让用户以为聚合自己有报价。
+      // 聚合的价值是「自动挑渠道」，倍率对它没有决策意义。
+      m.owned_by === 'aggregate' || String(m.id).startsWith('aggregate/')
+        ? null
+        : priceBadge(m.isFree === true
+          ? 0
+          : (m.priceFactor === undefined ? Number.POSITIVE_INFINITY : m.priceFactor)),
+    ]
+  })
+  box.appendChild(wrapTable(buildTable(
+    // ⚠️ 「区域」列已去掉（用户要求）—— 它只区分国内/国际，
+    // 对日常选模型没有决策价值，却占一格宽度。
+    ['模型 id', '名称', '所属提供商', '计费倍率'], rows,
+  )))
+
   const note = document.createElement('p'); note.className = 'hint'
-  note.textContent = '共 ' + data.length + ' 个模型（来自上游 /v3/config）'
+  note.textContent = `共 ${data.length} 个模型`
+  // ⚠️ 如实说明「倍率」的来源，免得用户以为它是上游的权威报价：
+  // 它是从模型**名字的后缀**（`· x0.05`）解析出来的，没标就是「不可用」。
+  // ⚠️ 说明必须**与实际数据源一致**：倍率现在取自**上游下发的 `credits` 字段**，
+  // 不再是从名字里抠 —— 旧文案写的「取自模型名后缀」「标不可用」都已过时。
+  note.textContent += '。计费倍率来自上游下发的字段；留空的表示该供应商未提供倍率'
   box.appendChild(note)
 }
 

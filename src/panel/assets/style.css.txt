@@ -1,6 +1,20 @@
 /* free-llm-router 管理面板样式 */
 :root {
   --bg: #0f1115; --panel: #171a21; --panel2: #1d2129; --line: #262b36;
+  /*
+   * ## 圆角令牌（用户要求「所有圆角统一成供应商与账号的大圆角」）
+   *
+   * ⚠️ 改之前全站有 **10 种**圆角值（3/4/6/8/10/12/14/16px…），
+   * 同类容器在不同页面上各不相同 —— 那是「每处单独调」积累出来的漂移，
+   * 不盯着看不出来，但整体观感就是不齐。
+   *
+   * ⇒ 收成**两个令牌**（对齐本项目「把 N 个独立值收敛成一个共享令牌」的纪律）：
+   *   · `--radius`    卡片/面板/弹窗等**大容器**（供应商卡就是 14px）
+   *   · `--radius-sm` 小控件（按钮/标签/输入框内的东西）
+   * ⚠️ 药丸形（`999px`，`.tag` / `.credits-pill`）**不动** ——
+   * 它是另一种设计语言（全圆），不是「圆角没统一」。
+   */
+  --radius: 14px; --radius-sm: 8px;
   --text: #e6e9ef; --dim: #9aa4b2;
   /*
    * ⚠️ accent **拆成两个令牌** —— 它们对底色的要求相反。
@@ -52,6 +66,7 @@ header {
   padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
 }
 .brand { display: flex; gap: 12px; align-items: center; }
+/* ⚠️ `h1` 已不在页面上（站名移到导航条内），但保留规则以防后续复用 */
 h1 { font-size: 15px; margin: 0; letter-spacing: .3px; }
 /*
  * 标题
@@ -74,7 +89,7 @@ nav {
 }
 .nav-item {
   background: transparent; border: 1px solid transparent; color: var(--dim);
-  padding: 6px 12px; border-radius: 6px; cursor: pointer; font: inherit;
+  padding: 6px 12px; border-radius: var(--radius-sm); cursor: pointer; font: inherit;
 }
 .nav-item:hover { color: var(--text); background: var(--panel2); }
 .nav-item.active { color: #fff; background: var(--accent); border-color: var(--accent); }
@@ -135,7 +150,7 @@ section.view > * { min-width: 0; }
 .auth { display: flex; gap: 8px; align-items: center; }
 input, select, textarea, button {
   font: inherit; color: var(--text); background: #10131a;
-  border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px;
+  border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 7px 9px;
 }
 textarea { width: 100%; font-family: ui-monospace, monospace; font-size: 12px; }
 button { cursor: pointer; background: var(--accent); border-color: var(--accent); color: #fff; }
@@ -158,7 +173,7 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .hint { color: var(--dim); font-size: 12px; margin: 0; }
 
 .out {
-  background: #0c0f14; border: 1px solid var(--line); border-radius: 8px;
+  background: #0c0f14; border: 1px solid var(--line); border-radius: var(--radius);
   padding: 10px; font-family: ui-monospace, monospace; font-size: 12px;
   white-space: pre-wrap; word-break: break-word; max-height: 420px; overflow: auto;
 }
@@ -192,7 +207,7 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .panel:has(> .out:empty) { display: none; }
 
 .notice {
-  background: #1a2432; border: 1px solid #2a3d57; border-radius: 10px; padding: 14px 16px;
+  background: #1a2432; border: 1px solid #2a3d57; border-radius: var(--radius); padding: 14px 16px;
 }
 .notice p { margin: 6px 0 0; font-size: 13px; color: var(--dim); }
 /*
@@ -209,7 +224,7 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .banner {
   display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between;
   background: #3a2020; border: 1px solid #5b2424; color: #ffd9d9;
-  border-radius: 10px; padding: 12px 16px; font-size: 13px;
+  border-radius: var(--radius); padding: 12px 16px; font-size: 13px;
 }
 .banner button { background: transparent; border-color: #7a3a3a; color: #ffd9d9; }
 
@@ -235,7 +250,7 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
 }
 .count {
-  background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
   padding: 9px 13px; min-width: 92px;
   box-shadow: 0 1px 2px rgba(0,0,0,.03);
 }
@@ -259,7 +274,7 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 }
 
 .card {
-  border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; margin-bottom: 8px;
+  border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 12px; margin-bottom: 8px;
   display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
   background: var(--panel);
   /* ⚠️ 与 `.panel` / `.kpi` 用同一套阴影与圆角 —— 用户要求「把其它界面的 UI
@@ -274,7 +289,12 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 }
 .card .grow { flex: 1 1 220px; }
 .tag { font-size: 11px; padding: 2px 7px; border-radius: 999px; border: 1px solid var(--line); }
-.tag.ok { color: var(--ok); border-color: #1e5b3a; }
+/*
+ * ⚠️ 「免费」徽章给一层**淡绿底**（用户要求「免费用绿色显示免费」）——
+ * 只有绿字在密集表格里不够显眼，而「免费」是最值得一眼看到的信息。
+ * ⚠️ 底色用 `rgba` 而不是写死的绿：深色主题下才不会变成一块刺眼的亮绿。
+ */
+.tag.ok { color: var(--ok); border-color: #1e5b3a; background: rgba(34, 197, 94, .12); }
 .tag.warn { color: var(--warn); border-color: #5b4a1e; }
 .tag.err { color: var(--err); border-color: #5b2424; }
 .metrics { color: var(--dim); font-size: 11px; font-family: ui-monospace, monospace; }
@@ -291,7 +311,7 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .err-msg {
   flex: 1 1 100%; font-size: 11px; line-height: 1.5;
   color: var(--err); background: rgba(239, 95, 95, 0.08);
-  border: 1px solid #5b2424; border-radius: 8px; padding: 6px 9px;
+  border: 1px solid #5b2424; border-radius: var(--radius-sm); padding: 6px 9px;
   overflow-wrap: anywhere; word-break: break-word;
 }
 html[data-theme='light'] .err-msg { background: #fdecec; border-color: #f0a0a0; }
@@ -353,7 +373,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 }
 .kpi {
   position: relative;
-  border: 1px solid var(--line); border-radius: 16px;
+  border: 1px solid var(--line); border-radius: var(--radius);
   padding: 14px 16px 13px;
   background: var(--panel);
   /* 柔和阴影（参考项目用 0 10px 18px -3px）——比纯描边更有层次 */
@@ -362,7 +382,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 }
 /* 左上角的彩色图标章 */
 .kpi-chip {
-  width: 26px; height: 26px; border-radius: 8px;
+  width: 26px; height: 26px; border-radius: var(--radius-sm);
   display: inline-flex; align-items: center; justify-content: center;
   font-size: 13px; line-height: 1; margin-bottom: 10px;
   background: var(--kpi-soft, rgba(79,140,255,.14));
@@ -418,7 +438,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .rank-row:last-child { border-bottom: 0; }
 /* 序号徽章：前三名给一个强调色，其余保持中性（不喧哗） */
 .rank-idx {
-  flex: none; width: 20px; height: 20px; border-radius: 6px;
+  flex: none; width: 20px; height: 20px; border-radius: var(--radius-sm);
   display: inline-flex; align-items: center; justify-content: center;
   font-size: 11px; font-weight: 600; color: var(--dim);
   background: var(--panel2);
@@ -459,7 +479,7 @@ html[data-theme='light'] .rank-idx { background: #eef1f5; }
 
 /* ─────────── 用量页：通用面板容器 ─────────── */
 .panel {
-  border: 1px solid var(--line); border-radius: 16px;
+  border: 1px solid var(--line); border-radius: var(--radius);
   /* ⚠️ 不写 `margin-bottom`：面板总是 `section.view`（`gap: 14px`）的子元素，
      间距由容器统一给。自己再加一份就是双重间距。 */
   background: var(--panel); padding: 14px 16px;
@@ -487,11 +507,11 @@ html[data-theme='light'] .rank-idx { background: #eef1f5; }
 /* ─────────── 时间窗分段控件（用量页） ─────────── */
 .seg {
   display: inline-flex; gap: 2px; padding: 3px; margin-bottom: 12px;
-  background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+  background: var(--panel2); border: 1px solid var(--line); border-radius: var(--radius-sm);
 }
 .seg-item {
   background: transparent; border: 0; color: var(--dim);
-  font-size: 12px; padding: 5px 12px; border-radius: 6px; cursor: pointer;
+  font-size: 12px; padding: 5px 12px; border-radius: var(--radius-sm); cursor: pointer;
   font-family: inherit; transition: background .12s, color .12s;
 }
 .seg-item:hover { color: var(--text); }
@@ -570,7 +590,7 @@ html[data-theme='light'] .trend-track { background: #e8ebf0; }
 /* ─────────── 供应商网格 ─────────── */
 .prov-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; }
 .prov-card {
-  border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px;
+  border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px;
   cursor: pointer; background: var(--panel); transition: border-color .12s, box-shadow .12s;
   box-shadow: 0 1px 2px rgba(0,0,0,.03);
 }
@@ -644,7 +664,7 @@ html[data-theme='light'] .trend-track { background: #e8ebf0; }
  * 与新版卡片并排明显不是一套。
  */
 .modal-box {
-  background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
   width: min(760px, 100%); max-height: 86vh; display: flex; flex-direction: column;
   box-shadow: 0 18px 48px rgba(0,0,0,.28);
 }
@@ -656,7 +676,7 @@ html[data-theme='light'] .trend-track { background: #e8ebf0; }
 .modal-tabs { display: flex; gap: 4px; padding: 8px 12px 0; border-bottom: 1px solid var(--line); }
 .mtab {
   background: transparent; border: 1px solid transparent; border-bottom: none;
-  color: var(--dim); padding: 6px 12px; border-radius: 6px 6px 0 0; cursor: pointer; font: inherit;
+  color: var(--dim); padding: 6px 12px; border-radius: var(--radius-sm) var(--radius-sm) 0 0; cursor: pointer; font: inherit;
   /* ⚠️ 同一排的标签**字号必须一致**：状态切换时字号差 1px 会肉眼可见地抖。 */
 }
 .mtab.active { color: var(--text); background: var(--panel2); border-color: var(--line); }
@@ -685,7 +705,7 @@ html[data-theme='light'] .trend-track { background: #e8ebf0; }
 /* ⚠️ 不写下边距（容器有 gap） */
 .task-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
 .task-card {
-  border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px;
+  border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px;
   background: var(--panel2); display: flex; flex-direction: column; gap: 8px;
 }
 .task-card h3 { margin: 0; font-size: 14px; }
@@ -732,7 +752,7 @@ html[data-theme='light'] button.ghost { background: #ffffff; }
 html[data-theme='light'] .out { background: #f8f9fb; }
 html[data-theme='light'] .bar-track { background: #e8ebf0; }
 html[data-theme='light'] .switch { background: #e8ebf0; }
-html[data-theme='light'] .tag.ok { border-color: #86c79a; }
+html[data-theme='light'] .tag.ok { border-color: #86c79a; background: #e7f5ec; }
 html[data-theme='light'] .tag.warn { border-color: #e0b878; }
 html[data-theme='light'] .tag.err { border-color: #f0a0a0; }
 html[data-theme='light'] .credits-pill { background: #e7f5ec; border-color: #86c79a; }
@@ -759,7 +779,7 @@ html[data-theme='light'] .model-row.off .mname { color: #9aa3b2; }
   grid-template-columns: repeat(auto-fill, minmax(min(340px, 100%), 1fr));
 }
 .key-card {
-  background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
   padding: 14px 16px; display: flex; flex-direction: column; gap: 10px;
   min-width: 0;
 }
@@ -776,7 +796,7 @@ html[data-theme='light'] .model-row.off .mname { color: #9aa3b2; }
 }
 .key-prefix {
   font-family: ui-monospace, monospace; font-size: 12px; color: var(--dim);
-  background: var(--panel2); border: 1px solid var(--line); border-radius: 6px;
+  background: var(--panel2); border: 1px solid var(--line); border-radius: var(--radius-sm);
   padding: 3px 8px; align-self: flex-start;
   overflow-wrap: anywhere;
 }
@@ -832,7 +852,7 @@ html[data-theme='light'] .model-row.off .mname { color: #9aa3b2; }
 .key-reveal code {
   flex: 1 1 240px; min-width: 0;
   font-family: ui-monospace, monospace; font-size: 12px;
-  background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+  background: var(--panel2); border: 1px solid var(--line); border-radius: var(--radius-sm);
   padding: 10px 12px; overflow-wrap: anywhere; user-select: all;
 }
 .key-reveal button { flex: none; }
@@ -855,7 +875,9 @@ html[data-theme='light'] .key-reveal code { background: #f1f3f6; }
 
 /* ─────────── 图标按钮 ─────────── */
 .icon-btn {
-  padding: 4px 9px; font-size: 15px; line-height: 1.2;
+  /* ⚠️ 缩小内边距（用户要求「右上角按钮缩小一点」），但**不缩触控区** ——
+     见下方 `header .icon-btn` 的 min-width/min-height 说明。 */
+  padding: 4px 6px; font-size: 15px; line-height: 1.2;
   display: inline-flex; align-items: center; justify-content: center;
 }
 
@@ -867,7 +889,16 @@ html[data-theme='light'] .key-reveal code { background: #f1f3f6; }
  * 图标大小不该决定可点区域，故这里给按钮一个独立的最小尺寸，
  * 图标仍居中保持 16px。用 min-* 而不是固定 px，桌面端不受影响。
  */
-header .icon-btn { min-width: 40px; min-height: 40px; }
+/*
+ * ⚠️ **可点区域的下限不能跟着视觉一起缩**（用户要求缩小外观）。
+ *
+ * 40px → **34px**：视觉上明显小了一圈，而手机上仍远高于「点不中」的临界
+ *（图标本身 16px，34px 的触控区仍有 2 倍于图标的命中面积）。
+ *
+ * ⚠️ 不要再往 24px 缩 —— 那会重复踩一次 P1 缺陷（图标渲染成 0×0 时按钮
+ * 缩到 20×10px，手机上基本点不中）。
+ */
+header .icon-btn { min-width: 34px; min-height: 34px; }
 
 /* 供应商卡片：积分放右上角 */
 .prov-card { position: relative; }
@@ -914,6 +945,10 @@ html[data-theme='light'] .prov-card .prov-credits { background: #e7f5ec; border-
   html:not([data-theme]) .switch { background: #e8ebf0; }
   html:not([data-theme]) .credits-pill,
   html:not([data-theme]) .prov-credits { background: #e7f5ec; border-color: #86c79a; }
+  /* ⚠️ 免费徽章：与 `html[data-theme='light'] .tag.ok` **成对** ——
+     两套浅色规则独立维护，只写一处就只在某种模式下生效
+     （本项目已为此踩过两次，见 AGENTS.md §9.1b ②g）。 */
+  html:not([data-theme]) .tag.ok { border-color: #86c79a; background: #e7f5ec; }
   html:not([data-theme]) .banner { background: #fdecec; border-color: #f0a0a0; color: #7f1d1d; }
   html:not([data-theme]) .notice { background: #eef4ff; border-color: #b9d0f5; }
   /* ⚠️ 与 `html[data-theme='light'] .cap.off` 成对：跟随系统（auto）模式
@@ -940,7 +975,7 @@ html[data-theme='light'] .prov-card .prov-credits { background: #e7f5ec; border-
   padding: 16px;
 }
 .login-card {
-  background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
   padding: 28px 26px; width: min(400px, 100%);
 }
 .login-card h1 { font-size: 17px; margin: 0 0 6px; }
@@ -961,7 +996,7 @@ html[data-theme='light'] .prov-card .prov-credits { background: #e7f5ec; border-
  */
 .qr-box {
   display: inline-block; margin: 10px 0; padding: 10px;
-  background: #fff; border-radius: 8px; line-height: 0;
+  background: #fff; border-radius: var(--radius-sm); line-height: 0;
 }
 .qr-box svg { width: 200px; height: 200px; display: block; }
 
@@ -975,7 +1010,7 @@ html[data-theme='light'] .prov-card .prov-credits { background: #e7f5ec; border-
  */
 .user-code {
   display: inline-block; margin: 10px 0; padding: 10px 16px;
-  background: #fff; color: #10131a; border-radius: 8px;
+  background: #fff; color: #10131a; border-radius: var(--radius-sm);
   font-family: ui-monospace, monospace; font-size: 26px; font-weight: 700;
   letter-spacing: 4px; user-select: all;
 }
@@ -1123,7 +1158,7 @@ main > * { min-width: 0; }
   .page-tools .seg { flex: 0 0 auto; }
 
   /* 面板内边距收紧，把宽度让给内容 */
-  .panel { padding: 12px 13px; border-radius: 14px; }
+  .panel { padding: 12px 13px; }  /* ⚠️ 圆角不再硬编码 —— 继承 --radius */
   .panel-head { margin-bottom: 10px; }
 }
 

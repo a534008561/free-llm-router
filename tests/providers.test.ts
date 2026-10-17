@@ -2169,3 +2169,42 @@ test('⚠️ 聚合白名单必须在 buildVirtualModels 里收口（覆盖目�
   assert.ok(server.includes('buildVirtualModels'), 'chat 路径应走 buildVirtualModels')
   assert.ok(idx.includes('buildVirtualModels'), '/v1/models 路径应走 buildVirtualModels')
 })
+
+test('🔴 TRAE / LobsterAI / OpenCode 都必须交出真实倍率（上游一直有，我们没读）', () => {
+  // ## 用户报：「TRAE 和 LobsterAI 还是不显示，OpenCode 有的不显示」
+  //
+  // ⚠️⚠️ **这是我的第三次同型错误**：只看「解析后的形状」就断定上游没有该字段。
+  // 加只读诊断 dump **原始响应**后，三家其实**都有**：
+  //
+  // | 家 | 上游字段 | 实测值 |
+  // |---|---|---|
+  // | LobsterAI | `costMultiplier` | `0.05` |
+  // | TRAE | `display_contact_config.consumption_rate.data.rate` | `0.06` / `0.39` |
+  // | OpenCode | `models.dev` 的 `cost`（判定 `isFree`） | `{input:0,output:0}` |
+  //
+  // ⇒ 教训：**先去上游原始响应里找字段**，不要因为解析后的对象里没有就下结论。
+
+  // ① LobsterAI：读 `costMultiplier` + 用 `limitedFreeActive` 判免费
+  const lb = readFileSync('src/providers/lobsterai.ts', 'utf8')
+  assert.ok(/readNumber\(record, 'costMultiplier'\)/.test(lb),
+    '⚠️ LobsterAI 必须读上游的 costMultiplier')
+  assert.ok(/limitedFreeActive/.test(lb),
+    '⚠️ 免费判据应用 limitedFreeActive（limitedFree 只是「有这个活动」）')
+
+  // ② TRAE：读 `display_contact_config`（**字符串化 JSON**）里的 consumption_rate
+  const tr = readFileSync('src/providers/trae.ts', 'utf8')
+  assert.ok(/readConsumptionRate/.test(tr), '⚠️ TRAE 应解析 consumption_rate')
+  assert.ok(/JSON\.parse\(raw\)/.test(tr),
+    '⚠️ display_contact_config 是**字符串**，必须 JSON.parse 才读得到 rate')
+  assert.ok(/rec\['enable'\] !== true/.test(tr),
+    '⚠️ enable !== true 时不得采信 rate（规则未启用）')
+
+  // ③ OpenCode：免费取**并集**（兜底表的匿名通道 / models.dev 的定价）
+  const oc = readFileSync('src/providers/opencode.ts', 'utf8')
+  assert.ok(/m\.isFree \|\| capability\?\.isFree === true/.test(oc),
+    '⚠️ OpenCode 免费应取并集（两个来源语义不同，任一为真都意味着不花钱）')
+
+  // ④ 🔴 冷启动必须主动拉能力表 —— 否则上面那条并集永远拿不到右侧
+  assert.ok(/await refreshCapabilities\(\)/.test(oc),
+    '⚠️ 能力表冷启动必须主动拉取（原实现只被自己的 stale 分支调用 ⇒ 永远不拉）')
+})

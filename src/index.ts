@@ -164,6 +164,9 @@ import {
   buildVirtualModels,
   type ProviderCatalog,
 } from './gateway/aggregate.js'
+// ⚠️ 计费倍率从模型名后缀解析（`· x0.05`）—— 与聚合排序**共用同一个实现**。
+// 各写一份必然分叉（聚合按它排序、面板按它展示，两处不一致会让用户困惑）。
+import { priceFactorFromName } from './providers/canonical-models.js'
 import {
   buildCodeArtsCallbackUrl,
   buildCodeArtsLoginUrl,
@@ -3357,7 +3360,29 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
           // ⚠️ **请求侧仍然接受裸名**（回退到默认供应商，见 `splitModelName`）：
           // 已有的客户端配置不会因为这个改动而失效，只是目录里不再列它。
           // 兼容与无歧义两件事分开处理 —— 目录负责「说清楚」，路由负责「不breaking」。
-          data.push({ ...base, id: `${providerId}/${m.id}` })
+          // ⚠️ 补三个面板要展示的字段（用户要求「加计费倍率和所属提供商」）：
+          //   · `priceFactor` —— 从模型名后缀（`· x0.05`）解析的计费倍率；
+          //     `Infinity` 表示「没标倍率」（不等于免费），`0` 才是免费。
+          //   · `providerName` —— 该家的展示名（`Buddy（国内版）`），
+          //     面板要显示「所属提供商」；光给 id 用户认不出中文别名。
+          //   · `realm` —— `cn` / `global`。同名模型跨 realm 也存在，
+          //     展示它才能解释「为什么同一个名字出现两次」。
+          //
+          // ⚠️ 只在这里补一次：`/v1/models` 的**所有供应商条目**都经过这一行，
+          // 逐家各写一遍必然漏（本项目已多次吃过「只改一半」的教训）。
+          data.push({
+            ...base,
+            id: `${providerId}/${m.id}`,
+            // ⚠️ **优先用 provider 解析出的真实倍率**（buddy 的 `credits` 字段）。
+            // 只有该家没提供时才退回「从模型名抠」—— 名字里通常不写倍率，
+            // 抠出来 39/46 都是空（我第一版就是这么错的）。
+            priceFactor: m.priceFactor ?? priceFactorFromName(m.name || m.id),
+            providerName: provider.name,
+            // ⚠️ 用 `picked.realm`（该账号**实际所在**的分片），
+            // 不按 providerId 猜 —— realm 是记在凭据的 `extras.realm` 上的，
+            // 同一家理论上可以有跨分片的账号。
+            realm: picked.realm,
+          })
         }
       } catch (error) {
         // ⚠️ 逐家兜错：一家失败不该让整个目录 500（用户可能只想用另一家）
@@ -3394,11 +3419,27 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       // ⚠️ `name` **必须给**：面板「模型」页有「名称」列，
       // 缺了就是**整列空白**（实测反馈：19 个 aggregate 条目名称列全空，
       // 看起来像渲染失败）。`VirtualModel` 本来就有 `name` 字段，只是没往外发。
+      // ⚠️ 聚合条目也要补 `priceFactor` / `providerName` / `realm`，
+      // 否则面板那几列对聚合行**全是空白**（与普通条目不一致，看着像坏了）。
+      //   · `priceFactor`：聚合条目不按倍率排序（它按**临期**排），
+      //     但「这个规范名底下最低倍率是多少」对用户仍有信息量 ——
+      //     取所有候选里**最小**的那个（即最便宜渠道）。
+      //   · `providerName`：显示「聚合」而不是留空。
+      //   · `realm`：聚合跨分片汇总，故标 `'*'`（面板据此显示「全部」）。
+      const cheapestOf = (cands: ReadonlyArray<{ price: number }>): number => {
+        const vals = cands.map((c) => c.price).filter((n) => Number.isFinite(n))
+        return vals.length === 0 ? Number.POSITIVE_INFINITY : Math.min(...vals)
+      }
       data.push({
         id: `${AGGREGATE_PROVIDER_ID}/${AGGREGATE_AUTO}`,
         object: 'model',
         owned_by: AGGREGATE_PROVIDER_ID,
         name: '自动选择（临期优先）',
+        priceFactor: cheapestOf(
+          virtuals.flatMap((v) => v.candidates),
+        ),
+        providerName: '聚合（跨渠道）',
+        realm: '*',
       })
       for (const v of virtuals) {
         data.push({
@@ -3407,6 +3448,9 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
           owned_by: AGGREGATE_PROVIDER_ID,
           // ⚠️ 兜底到 key：万一某条目 name 为空，也不该给一个空单元格
           name: v.name || v.key,
+          priceFactor: cheapestOf(v.candidates),
+          providerName: '聚合（跨渠道）',
+          realm: '*',
         })
       }
     } catch (error) {

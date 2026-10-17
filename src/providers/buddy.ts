@@ -35,6 +35,7 @@ import { cliChatHeaders, deriveDeviceId, referenceChatHeaders } from '../upstrea
 import { extractModels, type OpenAiModel } from '../gateway/models.js'
 import { prepareChatBody, sanitizeChatBody } from '../gateway/payload.js'
 import { parseAuthDocument, parseAuthPayload } from '../upstream/import.js'
+import { parseCreditsFactor } from './canonical-models.js'
 import { dailyCheckin, fetchBalance } from '../upstream/checkin.js'
 import { refreshCredential } from '../upstream/auth.js'
 import {
@@ -221,6 +222,11 @@ export function toProviderModels(models: OpenAiModel[]): ProviderModel[] {
     // 「免费」上游不直接下发（是营销状态，随时可变），故保持 false，
     // 不猜测 —— 猜错会让用户以为某个付费模型免费。
     isFree: false,
+    // ⚠️ 倍率取**上游真实字段** `credits`（如 `"x0.21"`），
+    // 不再从模型名里正则抠 —— 名字里根本没写，抠出来 39/46 都是空。
+    ...(parseCreditsFactor(m.credits) === undefined
+      ? {}
+      : { priceFactor: parseCreditsFactor(m.credits) as number }),
   }))
 }
 

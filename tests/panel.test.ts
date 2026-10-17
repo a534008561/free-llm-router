@@ -187,6 +187,9 @@ test('⚠️ /v1/models 必须只列「有账号」的供应商的模型（登�
   // ⚠️ 单测是**打包后**在 `.build/tests/` 下跑的，故相对路径要指回源码根。
   // 用 process.cwd()（脚本从仓库根运行）最稳。
   const src = readFileSync('src/index.ts', 'utf8')
+  // ⚠️ 断言**不变式**（前缀存在），不钉死 `data.push` 的**字面排版** ——
+  // 往对象里补 `priceFactor` / `providerName` / `realm` 后，原先「整行字面匹配」
+  // 会假失败，而**它要守的约束根本没变**。
   // 简单起见：断言关键标识符存在（比跨行正则更稳）
   assert.ok(src.includes('byProvider'), '/v1/models 应按供应商分组账号')
   assert.ok(/for \(const \[providerId, list\] of byProvider\)/.test(src), '应逐个有账号的供应商拉目录')
@@ -408,7 +411,7 @@ test('⚠️ /v1/models 目录里不得出现裸名（一律带 provider/ 前缀
   // 裸名根本分不清是哪一家。
   const src = readFileSync('src/index.ts', 'utf8')
   assert.ok(
-    /data\.push\(\{ \.\.\.base, id: `\$\{providerId\}\/\$\{m\.id\}` \}\)/.test(src),
+    /id: `\$\{providerId\}\/\$\{m\.id\}`/.test(src),
     '目录项必须带 provider/ 前缀',
   )
   // 不能再有针对默认供应商的裸名分支
@@ -1744,11 +1747,14 @@ test('🔴 二级弹窗不得使用无 CSS 定义的类名（.muted 曾是死类
   assert.ok(!/className = 'muted'/.test(js),
     "⚠️ 不得再用 .muted（它没有 CSS 定义，文字会完全无样式）")
   assert.ok(/\.hint\s*\{/.test(css), '.hint 必须有定义（二级弹窗统一用它）')
-  // ⚠️ 弹窗观感要与新卡片系统一致（16px 圆角 + 阴影）
+  // ⚠️ 弹窗观感要与卡片系统一致（**统一用 `--radius` 令牌** + 阴影）。
+  // 原先断言写死 16px，而用户要求「所有圆角统一成供应商与账号的大圆角」
+  // ⇒ 改成令牌后它假失败。**要守的约束没变**（同类容器圆角必须一致），
+  // 只是实现从「同一个数字」变成「同一个令牌」。
   const box = css.slice(css.indexOf('.modal-box {'))
   const body = box.slice(0, box.indexOf('}'))
-  assert.ok(/border-radius:\s*16px/.test(body),
-    '⚠️ .modal-box 圆角应与 .panel/.kpi 一致（16px）')
+  assert.ok(/border-radius:\s*var\(--radius\)/.test(body),
+    '⚠️ .modal-box 圆角应使用 --radius 令牌（与 .panel/.prov-card 一致）')
   assert.ok(/box-shadow/.test(body), '⚠️ .modal-box 应有阴影（与卡片系统一致）')
   // ⚠️⚠️ 弹窗内的卡片**必须与弹窗底差一档**，否则卡片「隐形」。
   // `.modal-box` 用的是 `--panel` ⇒ 卡片若也用 `--panel` 就是**同一颜色**
@@ -2042,4 +2048,133 @@ test('⚠️ 登录页：网络错误不得报成「密钥无效」（否则用�
     '⚠️ 不得把非 ok 一律判为密钥无效')
   // 自动登录只在**确认有效**时发生（网络抖动时不能删密钥/乱跳）
   assert.ok(/if \(verdict === 'ok'\)/.test(js), '⚠️ 自动进入必须只在确认有效时')
+})
+
+test('⚠️ 计费倍率徽章不得把「未标注」说成「不可用」（实测可调通）', () => {
+  // ⚠️ 参考 fork 把没有倍率标注的模型显示为「不可用」，但**实测不准确**：
+  // 那些模型（如 `buddy/hy4-preview-exp`）能**正常调通**，
+  // 只是上游没在名字里标倍率。显示「不可用」会让用户放弃一个可用的模型。
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  const fn = js.slice(js.indexOf('function priceBadge'))
+  const body = fn.slice(0, fn.indexOf('\n}'))
+  assert.ok(!/textContent = '不可用'/.test(body),
+    '⚠️ 不得显示「不可用」（实测这些模型可调通）')
+  // ⚠️ 也不能满屏「未标注」—— 一列里 39/46 都是同一个词，看着像坏了。
+  // 未知时**留空**更有信息量（空白＝这列对该批模型没意义）。
+  assert.ok(!/textContent = '未标注'/.test(body),
+    '⚠️ 未知倍率应留空，不要重复播报「未标注」')
+  // ⚠️ **免费优先**：`isFree` 必须压过 `priceFactor`（用户要求「免费用绿色」）。
+  // cline 的 21 个 `cline-free/*` 有 isFree 但不发 credits ⇒ 上一版整列空白。
+  // ⚠️ 判据要**宽松**：只要「priceBadge 的参数里先出现 isFree」即可，
+  // 不钉死换行与缩进（我第一版写死 `? 0` 紧跟换行，结果假失败）。
+  // ⚠️⚠️ 定位方式要**稳**。我为此返工三次：
+  //   1. `indexOf('async function loadModels')` 命中过非定义处；
+  //   2. `lastIndexOf` 在剥注释后偏移变了（注释被删 ⇒ 位置前移）；
+  //   3. 从 `loadModels` 往后找 `priceBadge(` 时，中间隔着一大段注释，
+  //      剥注释的正则在这个位置**没能完全剥净**，导致找不到。
+  // ⇒ 改用**唯一表头字面量**做锚点，再往前找最近的 `return [` ——
+  //    那是行构造块的起点，与函数位置无关。
+  const raw = panelAsset('/panel/app.js')?.body ?? ''
+  const headAt = raw.indexOf("'模型 id', '名称', '所属提供商'")
+  assert.ok(headAt > 0, '应能定位模型页表头')
+  const rowStart = raw.lastIndexOf('return [', headAt)
+  assert.ok(rowStart > 0, '应能定位行构造块')
+  const rowBody = raw.slice(rowStart, headAt)
+  assert.ok(/isFree/.test(rowBody),
+    '⚠️ isFree 必须参与倍率判定（否则免费的也显示空白）')
+  // ⚠️ isFree 要先于 priceFactor 出现（免费优先，不被 undefined 盖掉）
+  const ifAt = rowBody.indexOf('isFree')
+  const pfAt = rowBody.indexOf('priceFactor')
+  assert.ok(ifAt > 0 && (pfAt < 0 || ifAt < pfAt),
+    '⚠️ isFree 应优先于 priceFactor 判定')
+  // ⚠️ 区域列已删（用户要求）
+  assert.ok(!/'区域'/.test(raw), '⚠️ 模型页不应再有「区域」列')
+  // 三态语义必须都在：免费 / 倍率 / 未标注
+  assert.ok(/textContent = '免费'/.test(body), '免费态')
+  assert.ok(/'x' \+ factor/.test(body), '倍率态')
+})
+
+test('⚠️ 模型页必须自动加载 + 按钮语义改为「刷新目录」', () => {
+  // 用户要求：「模型页自动加载」「把加载改为刷新目录」。
+  const html = panelAsset('/panel/')?.body ?? ''
+  const js = stripJsComments(panelAsset('/panel/app.js')?.body ?? '')
+  assert.ok(html.includes('刷新目录'), '按钮文案应为「刷新目录」')
+  assert.ok(!/>加载</.test(html), '不应再有「加载」按钮文案')
+  assert.ok(/models: \(\) => loadModels\(\)/.test(js),
+    '⚠️ 模型视图应自动加载（loaders 里直接调 loadModels）')
+})
+
+test('🔴 模型页：聚合行不显示倍率 + 免费显示绿色 + 无区域列', () => {
+  // 用户三条要求：
+  //   1. 「aggregate 就不要显示倍率了」
+  //   2. 「免费用绿色显示免费」
+  //   3. 「把区域栏去掉」
+  const raw = panelAsset('/panel/app.js')?.body ?? ''
+  const css = stripCssComments(panelAsset('/panel/style.css')?.body ?? '')
+  const headAt = raw.indexOf("'模型 id', '名称', '所属提供商'")
+  assert.ok(headAt > 0, '应能定位模型页表头')
+  const rowBody = raw.slice(raw.lastIndexOf('return [', headAt), headAt)
+
+  // ① 聚合行不给倍率 —— 它的倍率是「各候选里最便宜的」这个**推导值**，
+  //    不是上游事实；显示它会让用户以为聚合自己有报价。
+  assert.ok(/owned_by === 'aggregate'/.test(rowBody),
+    '⚠️ 聚合行应显式跳过倍率显示')
+  const aggAt = rowBody.indexOf("=== 'aggregate'")
+  const callAt = rowBody.indexOf('priceBadge')
+  assert.ok(aggAt > 0 && aggAt < callAt,
+    '⚠️ 聚合判定必须在 priceBadge 之前（否则聚合仍会显示倍率）')
+
+  // ② 免费优先（isFree 压过 priceFactor）—— cline 的 21 个 cline-free 不发 credits
+  assert.ok(/isFree/.test(rowBody), '⚠️ isFree 必须参与判定')
+  assert.ok(rowBody.indexOf('isFree') < rowBody.indexOf('priceFactor'),
+    '⚠️ isFree 应优先于 priceFactor')
+
+  // ③ 免费徽章必须是**绿色**（`.tag.ok` 用 `--ok`）
+  const okRule = css.slice(css.indexOf('.tag.ok'))
+  assert.ok(/color:\s*var\(--ok\)/.test(okRule.slice(0, okRule.indexOf('}'))),
+    '⚠️ 「免费」必须是绿色（用户要求）')
+  // ⚠️ 浅色主题**两套**都要覆盖（本项目反复踩的坑）
+  assert.ok(/html\[data-theme='light'\]\s*\.tag\.ok/.test(css), '浅色（显式）要覆盖')
+  assert.ok(/html:not\(\[data-theme\]\)\s*\.tag\.ok/.test(css), '浅色（auto）要覆盖')
+
+  // ④ 区域列已删
+  assert.ok(!/'区域'/.test(raw), '⚠️ 不应再有「区域」列')
+})
+
+test('⚠️ 全站圆角必须收敛到 --radius 令牌（不得再写死具体像素）', () => {
+  // 用户要求「把所有圆角统一成供应商与账号的大圆角」。
+  // ⚠️ 改之前全站有 **10 种**圆角值（3/4/6/8/10/12/14/16px…），
+  // 同类容器在不同页面各不相同 —— 那是「每处单独调」积累出的漂移。
+  //
+  // ⇒ 收成两个令牌：`--radius`（大容器）/ `--radius-sm`（小控件）。
+  // ⚠️ 例外：药丸形（999px）、细进度条（3–4px，改大会显胖）、
+  //    以及 `50%`（圆形）都是**另一种设计语言**，不是「没统一」。
+  const css = stripCssComments(panelAsset('/panel/style.css')?.body ?? '')
+  assert.ok(/--radius:\s*\d+px/.test(css), '应有 --radius 令牌')
+  assert.ok(/--radius-sm:\s*\d+px/.test(css), '应有 --radius-sm 令牌')
+
+  const offenders: string[] = []
+  for (const m of css.matchAll(/border-radius:\s*([^;]+)/g)) {
+    const v = (m[1] ?? '').trim()
+    if (v.includes('var(--radius')) continue   // 用令牌 —— 合格
+    if (/999px|50%/.test(v)) continue          // 药丸 / 圆形 —— 另一种语言
+    if (/^3px|^4px/.test(v)) continue           // 细进度条 —— 刻意保持纤细
+    offenders.push(v)
+  }
+  assert.equal(offenders.length, 0,
+    `⚠️ 仍有写死的圆角未收敛到令牌：${offenders.join(' | ')}`)
+})
+
+test('⚠️ 顶栏图标按钮缩小但触控区不得低于 34px', () => {
+  // 用户要求「右上角的退出登录和主题按钮缩小一点」。
+  // ⚠️ 但不能一路缩到点不中 —— 项目有实测记录（P1）：
+  // 图标 SVG 曾渲染成 0×0，导致按钮缩到 20×10px，手机上基本点不中。
+  const css = stripCssComments(panelAsset('/panel/style.css')?.body ?? '')
+  const m = /header\s*\.icon-btn\s*\{\s*min-width:\s*(\d+)px/.exec(css)
+  assert.ok(m !== null, '应有 header .icon-btn 的最小宽度')
+  const w = Number(m[1])
+  assert.ok(w <= 38, `⚠️ 应缩小（${w}px 仍偏大）`)
+  assert.ok(w >= 34, `⚠️ 触控区不得低于 34px（实际 ${w}px，再小就点不中）`)
+  const html = panelAsset('/panel/')?.body ?? ''
+  assert.ok(!/width="16"/.test(html), '图标 SVG 也应缩小（16 → 14）')
 })

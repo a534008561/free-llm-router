@@ -111,6 +111,15 @@ export interface ProviderModel {
   supportsImage: boolean
   /** 是否免费额度模型。 */
   isFree: boolean
+  /**
+   * **计费倍率**（可选）。
+   *
+   * ⚠️ 用 `number | undefined` 而不是 `string`：
+   * 上游下发的是 `"x0.21"` 这种**形态各异**的字符串（有的家可能给数字），
+   * 由各 provider 自己解析成数字后填这里。
+   * `undefined` = **该家没提供**（不是「免费」，也不是「不可用」）。
+   */
+  priceFactor?: number
 }
 
 /** 余额信息（统一形状）。 */

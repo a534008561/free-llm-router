@@ -1158,6 +1158,10 @@ async function listModels(credential: ProviderCredential, signal: AbortSignal): 
     // （`trae.ts` 的 `TraeRemoteModel.multimodal` 注释记录了实测：
     // `multimodal: false` 的模型收到图后的回答与不带图完全一致）。
     supportsImage: model.multimodal === true,
+    // ⚠️ 倍率来自 `display_contact_config`（**字符串化 JSON**）里的
+    // `consumption_rate.data.rate` —— 实测 `0.06` / `0.39`。
+    // 解析不出时**不带上该字段**（`undefined` = 上游没给，不等于免费）。
+    ...(model.priceFactor === undefined ? {} : { priceFactor: model.priceFactor }),
     // TRAE 没有「免费额度模型」标记字段，如实为 false。
     isFree: false,
   }))
@@ -1191,6 +1195,13 @@ interface TraeRemoteModel {
   isEnabled?: boolean
   isHidden?: boolean
   usage?: string
+  /**
+   * **计费倍率**（上游 `display_contact_config.consumption_rate.data.rate`，实测 `0.06`）。
+   *
+   * ⚠️ 上游把这块信息塞在**一个 JSON 字符串**里（`display_contact_config`），
+   * 不是对象 —— 必须 `JSON.parse` 才拿得到（实测见诊断 dump）。
+   */
+  priceFactor?: number
   hasReasoningOptions: boolean
 }
 
@@ -1290,6 +1301,7 @@ function parseConfigEntry(
 
   const contextWindow = readContextWindow(entry)
   const maxOutputTokens = readDetailMaxTokens(entry)
+  const priceFactor = readConsumptionRate(entry)
 
   return {
     id,
@@ -1308,8 +1320,51 @@ function parseConfigEntry(
       ? {}
       : { isHidden: readBoolean(entry, 'is_invisible_to_user') }),
     ...(readString(entry, 'usage').length > 0 ? { usage: readString(entry, 'usage') } : {}),
+    // ⚠️ 只在**真的解析出正数**时才带上（0/缺失 = 上游没提供，
+    // 不是「免费」）——`undefined` 与 `0` 在面板上是两种完全不同的展示。
+    ...(priceFactor === undefined ? {} : { priceFactor }),
     hasReasoningOptions,
   }
+}
+
+/**
+ * 读上游的**计费倍率**。
+ *
+ * ## ⚠️ 它藏在一个 JSON **字符串**里
+ *
+ * 实测（只读诊断 dump，2026-10-11）：上游条目有个
+ * `display_contact_config`，值是**字符串化的 JSON**：
+ *
+ * ```json
+ * {"access":{"data":{...}},"consumption_rate":{"enable":true,"data":{"rate":0.06}}}
+ * ```
+ *
+ * ⚠️ 必须 `JSON.parse` 才能读到 `rate` —— 直接当对象取会得到 `undefined`，
+ * 表现就是「倍率列一直空着」。
+ *
+ * ⚠️ `enable !== true` 时**不采信** `rate`：那是「这条计费规则未启用」，
+ * 用它的数值会凭空造出一个不该存在的倍率。
+ */
+function readConsumptionRate(entry: Record<string, unknown>): number | undefined {
+  const raw = entry['display_contact_config']
+  if (typeof raw !== 'string' || raw.trim() === '') return undefined
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    // ⚠️ 解析失败**不抛错**：目录不是主流程，一条脏数据不该让整家目录失败。
+    return undefined
+  }
+  if (parsed === null || typeof parsed !== 'object') return undefined
+  const cr = (parsed as Record<string, unknown>)['consumption_rate']
+  if (cr === null || typeof cr !== 'object') return undefined
+  const rec = cr as Record<string, unknown>
+  if (rec['enable'] !== true) return undefined
+  const data = rec['data']
+  if (data === null || typeof data !== 'object') return undefined
+  const rate = (data as Record<string, unknown>)['rate']
+  if (typeof rate !== 'number' || !Number.isFinite(rate) || rate <= 0) return undefined
+  return rate
 }
 
 /**

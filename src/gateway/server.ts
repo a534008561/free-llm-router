@@ -31,6 +31,9 @@ import { prepareChatBody, sanitizeChatBody } from './payload.js'
 import { ERROR_CHECK_FRAMES, ERROR_HINT_PATTERN, aggregateSse, createFrameTranslator, detectErrorFrame, doneFrame, errorFrame, mayHaveUsage, parseSseLine, sseHeaders, translateFrame } from './stream.js'
 import { jsonError, parseRetryAfterMs } from './http.js'
 import { DEFAULT_PROVIDER, findProvider, providerIds } from '../providers/index.js'
+// ⚠️ 裸名别名（官方拼写 → 聚合规范名）—— 与 canonical-models 共用同一张表，
+// 免得「面板显示的规范名」与「路由认识的别名」两处各写一份、慢慢分叉。
+import { aggregateAliasForBareModel } from '../providers/canonical-models.js'
 import { bindBuddy } from '../providers/buddy.js'
 import {
   AGGREGATE_AUTO,
@@ -404,6 +407,27 @@ export async function handleChatCompletions(
   // ⚠️ 判据是**前缀完全匹配**（`=== id` 或 `startsWith(id + '/')`），
   // 不是「包含 `aggregate/`」—— 否则 `buddy/aggregate/x` 会被误吞。
   const AGG_PREFIX = `${AGGREGATE_PROVIDER_ID}/`
+  // ## 🔴 裸名别名也走这里（用户要求）
+  //
+  // 实测缺陷：客户端写官方拼写 `DeepSeek-V4.1-Flash`（大写 + 点）时，
+  // 裸名被**原样**送给默认供应商 buddy，而 buddy 的真实 id 是小写
+  // `deepseek-v4.1-flash` ⇒ 上游回 `service info not found`
+  // ⇒ 用户看到像「模型不存在」，实际只是拼写没归一。
+  //
+  // ⚠️⚠️ **必须在 `splitModelName` 之前判定**（所以我把它并进这个 guard）：
+  // 否则 `providerId` 被设成 `aggregate` 后，代码会走到下面按**注册表**
+  // 查供应商的地方，而 `aggregate` **不在注册表里**（它是虚拟 provider）
+  // ⇒ 报「未知供应商 aggregate」。我第一版就是这么写的，线上立刻复现。
+  const bareAlias = rawModel.includes('/')
+    ? undefined
+    : aggregateAliasForBareModel(rawModel)
+  if (bareAlias !== undefined) {
+    return await handleAggregateChat({
+      model: bareAlias,
+      wantsStream: (rawBody as Record<string, unknown>).stream === true,
+      rawBody, request, env, realm, ctx, sessionKey, subkey,
+    })
+  }
   if (rawModel === AGGREGATE_PROVIDER_ID || rawModel.startsWith(AGG_PREFIX)) {
     return await handleAggregateChat({
       model: rawModel.slice(AGG_PREFIX.length),
@@ -420,8 +444,10 @@ export async function handleChatCompletions(
   // 无前缀时回落到默认供应商（保持既有用户兼容 —— 他们已经在用裸模型名）。
   const routed = splitModelName(rawModel, providerIds(), DEFAULT_PROVIDER)
 
+  // ⚠️ 裸名别名已并入上面的 aggregate guard（必须早于 `splitModelName`）。
   const providerId = routed.provider
   const model = routed.model
+
 
   // ⚠️ **读客户端要的是流式还是非流式**（实测踩到的严重缺陷）。
   //

@@ -1572,3 +1572,50 @@ test('🔴 loomy 微信扫码登录已接线（后端两个端点 + 会话字段
   // ⑤ 微信 code 只用一次 ⇒ 拿到 rcode 后必须替换掉 uuid
   assert.ok(/rcode: auth\.rcode/.test(idx), '⚠️ 拿到 rcode 后应写回会话（避免重复用同一个 code）')
 })
+
+test('🔴 用量「N 天有记录」必须按日键去重（不得把两个 realm 相加）', () => {
+  // ## 用户报的缺陷：「1 天用量有时候会显示 2 天有记录，7 天会显示 8 天」
+  //
+  // 根因：面板把 cn 与 global 两个 realm 的 `activeDays` **相加**了。
+  // 每个 realm 各返回自己窗口内的活跃天数，而两个 realm 的天数会**重叠**
+  //（同一天两边都可能有用量）⇒ 相加把重叠的天算两遍。
+  //
+  // 实测（线上真实数据，7 天窗口）：cn=7 + global=3 = **10**，
+  // 而窗口本身只有 7 天。
+  //
+  // ⇒ 正确做法是按**日键**去重；而 `byDayMap` 恰好已按 `b.day` 合并过，
+  // 故活跃天数就是它的 size。
+  const js = readFileSync('src/panel/assets/app.js.txt', 'utf8')
+  assert.ok(!/const activeDays = sum\('activeDays'\)/.test(js),
+    '⚠️ 不得把两个 realm 的 activeDays 相加（重叠的天会被算两遍）')
+  assert.ok(/const activeDays = byDayMap\.size/.test(js),
+    '⚠️ activeDays 应取按日键去重后的天数（byDayMap.size）')
+})
+
+test('🔴 裸模型名别名：官方拼写应路由到聚合（用户要求）', () => {
+  // 用户原话：「把 DeepSeek-V4.1-Flash 路由到 buddy 改为路由到自动的 DeepSeek」。
+  //
+  // 实测缺陷：客户端写官方拼写 `DeepSeek-V4.1-Flash`（大写 + 点）时，
+  // 名字被原样送给 buddy，而 buddy 的真实 id 是小写 `deepseek-v4.1-flash`
+  // ⇒ 上游回 `model [DeepSeek-V4.1-Flash] service info not found`
+  // ⇒ 用户看到像「模型不存在」，实际只是拼写没归一。
+  const cm = readFileSync('src/providers/canonical-models.ts', 'utf8')
+  assert.ok(/BARE_MODEL_ALIASES/.test(cm), '应有裸名别名表')
+  assert.ok(/aggregateAliasForBareModel/.test(cm), '应有查表函数')
+  // 网关必须用它
+  const gw = readFileSync('src/gateway/server.ts', 'utf8')
+  assert.ok(/aggregateAliasForBareModel\(rawModel\)/.test(gw),
+    '⚠️ 网关应在裸名时查别名')
+  // ⚠️⚠️ 别名必须**早于 `splitModelName`**（并入 aggregate 的 guard）——
+  // 否则 `providerId` 被设成 `aggregate` 后会走到按**注册表**查供应商那步，
+  // 而 `aggregate` 不在注册表里（虚拟 provider）⇒ 报「未知供应商 aggregate」。
+  // 我第一版就是写在 `splitModelName` 之后，线上立刻复现了这个错。
+  const aliasAt = gw.indexOf('aggregateAliasForBareModel(rawModel)')
+  const splitAt = gw.indexOf('splitModelName(rawModel')
+  assert.ok(aliasAt > 0 && splitAt > 0, '应能定位两处')
+  assert.ok(aliasAt < splitAt,
+    '⚠️ 别名判定必须在 splitModelName **之前**（否则 aggregate 会被当成未知供应商）')
+  // ⚠️ 只在**裸名**时生效：显式写了 `buddy/xxx` 的意图明确，不该被改写
+  assert.ok(/rawModel\.includes\('\/'\)/.test(gw),
+    '⚠️ 别名只对**裸名**生效（带前缀的显式指定不得被改写）')
+})
